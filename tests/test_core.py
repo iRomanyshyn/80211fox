@@ -1,7 +1,10 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from fox80211.model import AccessPoint, normalize_mac
 from fox80211.tui import beep_interval, proximity
+from fox80211.system import _device_product
 
 
 class CoreTests(unittest.TestCase):
@@ -22,6 +25,14 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(proximity(-80)[0], "WEAK")
         self.assertEqual(proximity(-30)[0], "VERY CLOSE")
         self.assertLess(beep_interval(-35), beep_interval(-75))
+
+    def test_usb_product_can_be_found_on_parent(self):
+        with TemporaryDirectory() as directory:
+            parent = Path(directory) / "usb-device"
+            child = parent / "interface"
+            child.mkdir(parents=True)
+            (parent / "product").write_text("Netgear A6210\n")
+            self.assertEqual(_device_product(child), "Netgear A6210")
 
 
 if __name__ == "__main__":

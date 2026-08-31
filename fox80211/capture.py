@@ -15,6 +15,7 @@ class TsharkCapture:
         self.interface = interface
         self.events: queue.Queue[tuple[str, str, int, int | None, int | None]] = queue.Queue()
         self.process: subprocess.Popen[str] | None = None
+        self.reader: threading.Thread | None = None
 
     def start(self) -> None:
         args = ["tshark", "-l", "-n", "-i", self.interface, "-Y", "wlan.fc.type_subtype == 8 || wlan.fc.type_subtype == 5", "-T", "fields"]
@@ -22,7 +23,8 @@ class TsharkCapture:
             args += ["-e", field]
         args += ["-E", "separator=\t", "-E", "quote=d"]
         self.process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-        threading.Thread(target=self._read, daemon=True).start()
+        self.reader = threading.Thread(target=self._read, name="80211fox-capture", daemon=True)
+        self.reader.start()
 
     def _read(self) -> None:
         assert self.process and self.process.stdout
@@ -43,6 +45,9 @@ class TsharkCapture:
                 self.process.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 self.process.kill()
+                self.process.wait()
+        if self.reader and self.reader is not threading.current_thread():
+            self.reader.join(timeout=2)
 
 
 def _integer(value: str) -> int | None:

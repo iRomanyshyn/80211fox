@@ -47,6 +47,7 @@ class Application:
         self.hunt: AccessPoint | None = None
         self.beep = False
         self.last_beep = 0.0
+        self.stop_event = threading.Event()
 
     def run(self) -> None:
         frequencies = available_frequencies(self.adapter.phy)
@@ -55,7 +56,7 @@ class Application:
         with MonitorInterface(self.adapter) as monitor:
             capture = TsharkCapture(monitor.name)
             capture.start()
-            hopper = threading.Thread(target=self._hop, args=(monitor, frequencies), daemon=True)
+            hopper = threading.Thread(target=self._hop, args=(monitor, frequencies), name="80211fox-hopper", daemon=True)
             hopper.start()
             try:
                 self.screen.nodelay(True)
@@ -66,21 +67,23 @@ class Application:
                     time.sleep(0.05)
             finally:
                 self.running = False
+                self.stop_event.set()
+                hopper.join(timeout=2)
                 capture.stop()
 
     def _hop(self, monitor: MonitorInterface, frequencies: list[tuple[int, int]]) -> None:
-        while self.running:
+        while not self.stop_event.is_set():
             if self.hunt is None:
                 for frequency, _ in frequencies:
-                    if not self.running or self.hunt is not None:
+                    if self.stop_event.is_set() or self.hunt is not None:
                         break
                     try:
                         monitor.set_frequency(frequency)
                     except Exception:
                         pass  # Regulatory/driver constraints are authoritative.
-                    time.sleep(0.35)
+                    self.stop_event.wait(0.35)
             else:
-                time.sleep(0.1)
+                self.stop_event.wait(0.1)
 
     def _events(self, capture: TsharkCapture) -> None:
         while True:
@@ -166,10 +169,14 @@ class Application:
 
 
 def proximity(rssi: float) -> tuple[str, int]:
-    if rssi < -75: return "WEAK", 1
-    if rssi < -60: return "MODERATE", 2
-    if rssi < -45: return "GOOD", 3
-    if rssi < -35: return "CLOSE", 4
+    if rssi < -75:
+        return "WEAK", 1
+    if rssi < -60:
+        return "MODERATE", 2
+    if rssi < -45:
+        return "GOOD", 3
+    if rssi < -35:
+        return "CLOSE", 4
     return "VERY CLOSE", 5
 
 
@@ -182,4 +189,3 @@ def configure_colors() -> None:
     curses.use_default_colors()
     for pair, color in enumerate((curses.COLOR_RED, curses.COLOR_YELLOW, curses.COLOR_GREEN, curses.COLOR_CYAN, curses.COLOR_MAGENTA), 1):
         curses.init_pair(pair, color, -1)
-

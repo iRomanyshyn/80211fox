@@ -35,7 +35,7 @@ def discover_adapters() -> list[Adapter]:
         driver = driver_link.resolve().name if driver_link.exists() else "?"
         vendor = _read(device_path / "vendor")
         device = _read(device_path / "device")
-        model = _read(device_path / "product")
+        model = _device_product(device_path)
         description = model or ":".join(x.removeprefix("0x") for x in (vendor, device) if x) or "?"
         adapters.append(Adapter(name, phy, driver, description, mode_match.group(1) if mode_match else "?"))
 
@@ -52,6 +52,29 @@ def _read(path: Path) -> str:
         return path.read_text().strip()
     except OSError:
         return ""
+
+
+def _device_product(path: Path) -> str:
+    """Find a human-readable product on the device or a parent (common for USB)."""
+    try:
+        current = path.resolve()
+    except OSError:
+        return ""
+    for candidate in (current, *current.parents):
+        if candidate == Path("/sys"):
+            break
+        product = _read(candidate / "product")
+        if product:
+            return product
+    return ""
+
+
+def _link_is_up(interface: str) -> bool:
+    try:
+        flags = int(_read(Path("/sys/class/net") / interface / "flags"), 16)
+    except ValueError:
+        return False
+    return bool(flags & 0x1)  # Linux IFF_UP (administrative state).
 
 
 def _connected_interfaces() -> set[str]:
@@ -98,6 +121,7 @@ class MonitorInterface:
         self.created = False
         self.changed = False
         self.nm_managed = False
+        self.was_up = False
 
     def __enter__(self) -> "MonitorInterface":
         try:
@@ -108,6 +132,7 @@ class MonitorInterface:
                 self.name = self.adapter.interface
                 if self.adapter.connected:
                     raise RuntimeError("refusing in-place monitor mode on an active connection")
+                self.was_up = _link_is_up(self.name)
                 self.nm_managed = self._set_nm(False)
                 run("ip", "link", "set", self.name, "down")
                 run("iw", "dev", self.name, "set", "type", "monitor")
@@ -134,7 +159,8 @@ class MonitorInterface:
         elif self.changed:
             run("ip", "link", "set", self.name, "down", check=False)
             run("iw", "dev", self.name, "set", "type", self.adapter.mode, check=False)
-            run("ip", "link", "set", self.name, "up", check=False)
+            if self.was_up:
+                run("ip", "link", "set", self.name, "up", check=False)
             if self.nm_managed:
                 self._set_nm(True)
 
