@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "80211fox"
+version = "0.1.0"
+description = "A small Linux TUI for physically locating Wi-Fi access points"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = []
+
+[project.scripts]
+80211fox = "fox80211.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["fox80211*"]
