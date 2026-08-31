@@ -122,7 +122,11 @@ def available_frequencies(phy: str) -> list[tuple[int, int]]:
     text = run("iw", "phy", phy, "info")
     found: list[tuple[int, int]] = []
     for line in text.splitlines():
-        match = re.search(r"\*\s+(\d+) MHz \[(\d+)\]", line)
+        # iw may render frequencies with a decimal (for example, ``2412.0
+        # MHz``), while other releases render ``2412 MHz``. Channel tuning
+        # still uses whole MHz here, so accept either representation when the
+        # fractional component is zero.
+        match = re.search(r"\*\s+(\d+)(?:\.0+)?\s+MHz\s+\[(\d+)\]", line)
         if match and "disabled" not in line:
             found.append((int(match.group(1)), int(match.group(2))))
     return found
