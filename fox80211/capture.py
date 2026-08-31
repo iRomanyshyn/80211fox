@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import queue
 import subprocess
+import tempfile
 import threading
 
 
@@ -16,13 +17,15 @@ class TsharkCapture:
         self.events: queue.Queue[tuple[str, str, int, int | None, int | None]] = queue.Queue()
         self.process: subprocess.Popen[str] | None = None
         self.reader: threading.Thread | None = None
+        self.stderr = tempfile.TemporaryFile(mode="w+t")
+        self.stopping = False
 
     def start(self) -> None:
         args = ["tshark", "-l", "-n", "-i", self.interface, "-Y", "wlan.fc.type_subtype == 8 || wlan.fc.type_subtype == 5", "-T", "fields"]
         for field in self.FIELDS:
             args += ["-e", field]
         args += ["-E", "separator=\t", "-E", "quote=d"]
-        self.process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        self.process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=self.stderr, text=True)
         self.reader = threading.Thread(target=self._read, name="80211fox-capture", daemon=True)
         self.reader.start()
 
@@ -39,6 +42,7 @@ class TsharkCapture:
                 continue
 
     def stop(self) -> None:
+        self.stopping = True
         if self.process and self.process.poll() is None:
             self.process.terminate()
             try:
@@ -48,6 +52,19 @@ class TsharkCapture:
                 self.process.wait()
         if self.reader and self.reader is not threading.current_thread():
             self.reader.join(timeout=2)
+        self.stderr.close()
+
+    def raise_if_failed(self) -> None:
+        if not self.process or self.stopping:
+            return
+        status = self.process.poll()
+        if status is None:
+            return
+        self.stderr.flush()
+        self.stderr.seek(0)
+        detail = self.stderr.read().strip()
+        message = detail.splitlines()[-1] if detail else f"exit status {status}"
+        raise RuntimeError(f"tshark capture stopped: {message}")
 
 
 def _integer(value: str) -> int | None:

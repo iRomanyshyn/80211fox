@@ -16,6 +16,7 @@ class Adapter:
     device: str = "?"
     mode: str = "?"
     connected: bool = False
+    connection_known: bool = True
     monitor: bool = False
 
 
@@ -49,4 +50,3 @@ class AccessPoint:
         mac_query = normalize_mac(query)
         mac_like = bool(mac_query) and all(c in "0123456789abcdef:-." for c in query)
         return query in self.ssid.casefold() or (mac_like and mac_query in normalize_mac(self.bssid))
-

@@ -38,8 +38,9 @@ in `system.py`.
   beep cadence. The raw current value remains visible.
 * A separate monitor VIF is attempted first. Interface-combination limits or a
   driver may reject it. Only then does 80211fox use the selected interface in
-  place; it refuses that fallback for an active connection. NetworkManager is
-  changed only for that fallback and is restored during cleanup.
+  place; it refuses that fallback when nl80211 reports an active connection or
+  cannot determine association state. NetworkManager is changed only for that
+  fallback, and its original managed state is restored during cleanup.
 * A monitor VIF on the same PHY does **not** create another radio: concurrent
   managed and monitor VIFs generally share a channel. Use the separate USB PHY
   described in the intended workflow for hopping without disrupting the main
@@ -70,7 +71,8 @@ of observations and has no curses dependency, leaving room for JSON/CLI output.
 In SCAN, type to filter by partial case-insensitive SSID or BSSID; punctuation
 and case in MAC addresses are ignored. Backspace edits, arrows select, and
 Enter starts HUNT. In HUNT, `B` toggles cadence beeps, `R` resets statistics,
-Escape returns to scanning, and `Q` quits.
+Escape returns to scanning, and `Q` quits. Proximity beeps stop when the target
+has not been observed for two seconds rather than repeating a stale RSSI.
 
 Cleanup is context-managed. Normal exit, Ctrl-C, the installed SIGTERM handler,
 and Python exceptions stop
