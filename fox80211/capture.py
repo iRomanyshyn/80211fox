@@ -63,7 +63,10 @@ class TsharkCapture:
         self.stderr.flush()
         self.stderr.seek(0)
         detail = self.stderr.read().strip()
-        message = detail.splitlines()[-1] if detail else f"exit status {status}"
+        # TShark commonly prints the actionable startup failure first and ends
+        # with a generic packet count. Preserve a bounded diagnostic instead of
+        # reducing it to that unhelpful final line.
+        message = detail[-8192:] if detail else f"exit status {status}"
         raise RuntimeError(f"tshark capture stopped: {message}")
 
 

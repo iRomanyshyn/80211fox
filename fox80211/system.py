@@ -9,7 +9,11 @@ from .model import Adapter
 
 
 def run(*args: str, check: bool = True) -> str:
-    return subprocess.run(args, check=check, text=True, capture_output=True).stdout
+    # iw/nmcli output is parsed below, so never let the invoking user's locale
+    # translate stable tokens such as NetworkManager's `yes`/`no` values.
+    environment = os.environ.copy()
+    environment["LC_ALL"] = "C"
+    return subprocess.run(args, check=check, text=True, capture_output=True, env=environment).stdout
 
 
 def discover_adapters() -> list[Adapter]:
@@ -41,7 +45,7 @@ def discover_adapters() -> list[Adapter]:
 
     monitor_phys = _monitor_phys()
     for adapter in adapters:
-        associated = _interface_associated(adapter.interface)
+        associated = _interface_associated(adapter.interface, adapter.mode)
         adapter.connected = associated is True
         adapter.connection_known = associated is not None
         adapter.monitor = adapter.phy in monitor_phys
@@ -78,8 +82,12 @@ def _link_is_up(interface: str) -> bool:
     return bool(flags & 0x1)  # Linux IFF_UP (administrative state).
 
 
-def _interface_associated(interface: str) -> bool | None:
+def _interface_associated(interface: str, mode: str = "managed") -> bool | None:
     """Ask nl80211 directly; unknown must never be treated as safe to disrupt."""
+    if mode != "managed":
+        # `iw dev … link` describes station association. In AP/P2P/mesh modes,
+        # "Not connected" does not mean that the interface is idle.
+        return None
     try:
         text = run("iw", "dev", interface, "link")
     except (FileNotFoundError, subprocess.CalledProcessError):
@@ -134,8 +142,20 @@ class MonitorInterface:
         self.nm_changed = False
         self.was_up = False
 
+    def _isolate_original(self) -> None:
+        """Keep NetworkManager and the managed VIF from retuning this PHY."""
+        self.was_up = _link_is_up(self.adapter.interface)
+        self.original_managed = self._nm_managed(self.adapter.interface)
+        if self.original_managed is True:
+            self.nm_changed = True
+            self._set_nm(self.adapter.interface, False)
+        if self.was_up:
+            self.link_changed = True
+            run("ip", "link", "set", self.adapter.interface, "down")
+
     def __enter__(self) -> "MonitorInterface":
         try:
+            self._isolate_original()
             try:
                 run("iw", "phy", self.adapter.phy, "interface", "add", self.name, "type", "monitor")
                 self.created = True
@@ -144,15 +164,10 @@ class MonitorInterface:
                 if self.adapter.connected or not self.adapter.connection_known:
                     reason = "active connection" if self.adapter.connected else "unknown connection state"
                     raise RuntimeError(f"refusing in-place monitor mode: {reason}")
-                self.was_up = _link_is_up(self.name)
-                self.original_managed = self._nm_managed()
-                if self.original_managed is True:
-                    self.nm_changed = True
-                    self._set_nm(False)
                 # Record each mutation before the next command can fail so
                 # __enter__ can reverse partially completed setup.
-                self.link_changed = True
-                run("ip", "link", "set", self.name, "down")
+                if not self.link_changed:
+                    run("ip", "link", "set", self.name, "down")
                 self.type_changed = True
                 run("iw", "dev", self.name, "set", "type", "monitor")
                 self.changed = True
@@ -165,15 +180,15 @@ class MonitorInterface:
     def set_frequency(self, frequency: int) -> None:
         run("iw", "dev", self.name, "set", "freq", str(frequency))
 
-    def _nm_managed(self) -> bool | None:
+    def _nm_managed(self, interface: str) -> bool | None:
         try:
-            value = run("nmcli", "-g", "GENERAL.MANAGED", "device", "show", self.name).strip().casefold()
+            value = run("nmcli", "-g", "GENERAL.MANAGED", "device", "show", interface).strip().casefold()
         except (FileNotFoundError, subprocess.CalledProcessError):
             return None
         return {"yes": True, "no": False}.get(value)
 
-    def _set_nm(self, managed: bool) -> None:
-        run("nmcli", "device", "set", self.name, "managed", "yes" if managed else "no")
+    def _set_nm(self, interface: str, managed: bool) -> None:
+        run("nmcli", "device", "set", interface, "managed", "yes" if managed else "no")
 
     def close(self) -> None:
         if self.created:
@@ -182,13 +197,13 @@ class MonitorInterface:
             if self.type_changed:
                 run("ip", "link", "set", self.name, "down", check=False)
                 run("iw", "dev", self.name, "set", "type", self.adapter.mode, check=False)
-            if self.link_changed and self.was_up:
-                run("ip", "link", "set", self.name, "up", check=False)
-            if self.nm_changed and self.original_managed is not None:
-                try:
-                    self._set_nm(self.original_managed)
-                except (FileNotFoundError, subprocess.CalledProcessError):
-                    pass
+        if self.link_changed and self.was_up:
+            run("ip", "link", "set", self.adapter.interface, "up", check=False)
+        if self.nm_changed and self.original_managed is not None:
+            try:
+                self._set_nm(self.adapter.interface, self.original_managed)
+            except (FileNotFoundError, subprocess.CalledProcessError):
+                pass
 
     def __exit__(self, *_: object) -> None:
         self.close()
