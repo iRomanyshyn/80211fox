@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 
 from fox80211.capture import TsharkCapture
 from fox80211.model import AccessPoint, Adapter
-from fox80211.system import MonitorInterface, _interface_associated
+from fox80211.system import MonitorInterface, _interface_associated, available_frequencies
 from fox80211.tui import Application
 
 
@@ -160,6 +160,19 @@ class ReviewFixTests(unittest.TestCase):
 
         run("nmcli", "device")
         self.assertEqual(subprocess_run.call_args.kwargs["env"]["LC_ALL"], "C")
+
+    @patch("fox80211.system.run")
+    def test_available_frequencies_accepts_decimal_iw_output(self, run):
+        run.return_value = """\
+Band 1:
+\tFrequencies:
+\t\t* 2412.0 MHz [1] (20.0 dBm)
+\t\t* 2437.0 MHz [6] (disabled)
+\t\t* 2462 MHz [11] (20.0 dBm)
+"""
+
+        self.assertEqual(available_frequencies("phy1"), [(2412, 1), (2462, 11)])
+        run.assert_called_once_with("iw", "phy", "phy1", "info")
 
     @patch("fox80211.system._link_is_up", return_value=True)
     @patch("fox80211.system.run")
