@@ -1,4 +1,5 @@
 # 80211fox
+**find access points by signal**
 
 A small Linux TUI for physically locating a Wi-Fi access point by SSID/BSSID,
 RSSI, channel locking, and proximity beeps. It leaves unrelated Wi-Fi PHYs alone.
@@ -15,7 +16,9 @@ The MVP uses only Python's standard library plus common distribution packages:
   dependencies, and Kali-specific tools. Capture is separate from the TUI.
 * **sysfs** supplies driver and USB/PCI identity, while optional `nmcli` reports
   active connections and manages only the selected fallback interface.
-* **stdlib `curses`** keeps installation small. The initial privilege model is
+* **stdlib `curses`** keeps installation small. Sound uses a small backend
+  boundary: the zero-dependency terminal bell can be disabled and real audio
+  can be added later without coupling it to the TUI. The privilege model is
   deliberately simple: run the complete program as root. It never invokes
   `sudo` itself. A small privileged helper is a possible later refinement.
 
@@ -36,11 +39,14 @@ in `system.py`.
 * Radiotap may contain one signal value per antenna. TShark can emit these as a
   list; 80211fox uses the strongest value, then applies an EWMA for the bar and
   beep cadence. The raw current value remains visible.
-* A separate monitor VIF is attempted first. Interface-combination limits or a
+* The selected PHY is dedicated to hunting. Its original interface is made
+  unmanaged and down before a separate monitor VIF is attempted, preventing
+  NetworkManager background scans from fighting channel hopping on the same
+  radio. Interface-combination limits or a
   driver may reject it. Only then does 80211fox use the selected interface in
   place; it refuses that fallback when nl80211 reports an active connection or
-  cannot determine association state. NetworkManager is changed only for that
-  fallback, and its original managed state is restored during cleanup.
+  cannot determine association state. Its original link and NetworkManager
+  states are restored during cleanup in either path.
 * A monitor VIF on the same PHY does **not** create another radio: concurrent
   managed and monitor VIFs generally share a channel. Use the separate USB PHY
   described in the intended workflow for hopping without disrupting the main
@@ -65,14 +71,19 @@ sudo python3 -m fox80211.cli
 
 `--interface wlan1` skips adapter selection. The capture class exposes a queue
 of observations and has no curses dependency, leaving room for JSON/CLI output.
+The default `--sound terminal` asks the terminal to ring its bell (which terminal
+settings may suppress or render visually); `--sound off` disables sound.
 
 ## Controls
 
 In SCAN, type to filter by partial case-insensitive SSID or BSSID; punctuation
 and case in MAC addresses are ignored. Backspace edits, arrows select, and
 Enter starts HUNT. In HUNT, `B` toggles cadence beeps, `R` resets statistics,
-Escape returns to scanning, and `Q` quits. Proximity beeps stop when the target
-has not been observed for two seconds rather than repeating a stale RSSI.
+Escape returns to scanning, and `Q` quits. After two seconds without the target,
+beeps stop and HUNT displays `SIGNAL LOST` instead of stale strength. SCAN dims
+observations after ten seconds, sorts them behind live APs, and removes them
+after thirty seconds. Its status reports usable/rejected tunes; a failed HUNT
+lock is reported in SCAN rather than terminating the program.
 
 Cleanup is context-managed. Normal exit, Ctrl-C, the installed SIGTERM handler,
 and Python exceptions stop

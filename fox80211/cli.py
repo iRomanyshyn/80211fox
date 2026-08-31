@@ -9,11 +9,13 @@ import sys
 
 from .system import discover_adapters
 from .tui import Application, configure_colors, select_adapter
+from .sound import DisabledSound, TerminalBell
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Passively locate Wi-Fi access points")
     parser.add_argument("--interface", help="preselect a wireless interface")
+    parser.add_argument("--sound", choices=("terminal", "off"), default="terminal", help="beep backend (default: terminal)")
     args = parser.parse_args()
     missing = [tool for tool in ("iw", "ip", "tshark") if not shutil.which(tool)]
     if missing:
@@ -37,7 +39,8 @@ def main() -> int:
         assert adapter
         if not adapter.monitor:
             raise RuntimeError(f"{adapter.phy} does not advertise monitor mode")
-        Application(screen, adapter).run()
+        sound = TerminalBell() if args.sound == "terminal" else DisabledSound()
+        Application(screen, adapter, sound).run()
 
     try:
         curses.wrapper(run)
