@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 from fox80211.capture import TsharkCapture, _ssid
 from fox80211.model import AccessPoint, Adapter
 from fox80211.system import MonitorInterface, _interface_associated, available_frequencies
-from fox80211.tui import HOP_DWELL, Application, scan_expiry
+from fox80211.tui import HOP_DWELL, HOP_TUNE_BUDGET, Application, scan_expiry
 
 
 class FakeScreen:
@@ -48,12 +48,20 @@ class ReviewFixTests(unittest.TestCase):
         return Application(screen or FakeScreen(), Adapter("wlan1", "phy1"))
 
     def test_tshark_hex_ssid_is_decoded_for_display(self):
-        self.assertEqual(_ssid("4176656e676120436f72706f"), "Avenga Corpo")
-        self.assertEqual(_ssid("D0A2D0B5D181D182"), "Тест")
+        self.assertEqual(_ssid("4176656e676120436f72706f", "4176656e676120436f72706f"), "Avenga Corpo")
+        self.assertEqual(_ssid("D0A2D0B5D181D182", "d0:a2:d0:b5:d1:81:d1:82"), "Тест")
 
     def test_hidden_and_plain_text_ssids_are_preserved(self):
         self.assertEqual(_ssid(""), "<hidden>")
-        self.assertEqual(_ssid("Office Wi-Fi"), "Office Wi-Fi")
+        self.assertEqual(_ssid("Office Wi-Fi", "4f66666963652057692d4669"), "Office Wi-Fi")
+
+    def test_plain_hexadecimal_looking_ssids_are_preserved(self):
+        self.assertEqual(_ssid("Cafe", "43616665"), "Cafe")
+        self.assertEqual(_ssid("1234", "31323334"), "1234")
+        self.assertEqual(_ssid("deadbeef", "6465616462656566"), "deadbeef")
+
+    def test_null_filled_ssids_are_hidden(self):
+        self.assertEqual(_ssid("0000", "0000"), "<hidden>")
 
     def test_hidden_beacon_does_not_replace_learned_ssid(self):
         app = self.make_app()
@@ -133,7 +141,7 @@ class ReviewFixTests(unittest.TestCase):
         self.assertLessEqual(len(controls[0]), 47)
 
     def test_expiry_covers_complete_channel_sweep(self):
-        self.assertGreater(scan_expiry(100), HOP_DWELL * 100)
+        self.assertGreaterEqual(scan_expiry(100), (HOP_DWELL + HOP_TUNE_BUDGET) * 100)
 
     def test_failed_frequency_is_removed_from_usable_set(self):
         app = self.make_app()

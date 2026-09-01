@@ -15,6 +15,7 @@ STALE_AFTER = 10.0
 EXPIRE_AFTER = 30.0
 LOST_AFTER = 2.0
 HOP_DWELL = 0.35
+HOP_TUNE_BUDGET = 0.1
 
 
 def select_adapter(screen: curses.window, adapters: list[Adapter]) -> Adapter:
@@ -251,7 +252,10 @@ def command_error(error: Exception) -> str:
 
 
 def scan_expiry(frequency_count: int) -> float:
-    return max(EXPIRE_AFTER, HOP_DWELL * (frequency_count + 1))
+    # Each hop includes both the dwell and an external `iw` tuning command.
+    # Reserve a per-channel tuning/scheduling budget as well as one complete
+    # extra hop so observations remain visible until their channel is revisited.
+    return max(EXPIRE_AFTER, (HOP_DWELL + HOP_TUNE_BUDGET) * (frequency_count + 1))
 
 
 def proximity(rssi: float) -> tuple[str, int]:
