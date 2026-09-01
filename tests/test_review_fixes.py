@@ -5,10 +5,10 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
-from fox80211.capture import TsharkCapture
+from fox80211.capture import TsharkCapture, _ssid
 from fox80211.model import AccessPoint, Adapter
 from fox80211.system import MonitorInterface, _interface_associated, available_frequencies
-from fox80211.tui import Application
+from fox80211.tui import HOP_DWELL, Application, scan_expiry
 
 
 class FakeScreen:
@@ -46,6 +46,14 @@ class FakeScreen:
 class ReviewFixTests(unittest.TestCase):
     def make_app(self, screen=None):
         return Application(screen or FakeScreen(), Adapter("wlan1", "phy1"))
+
+    def test_tshark_hex_ssid_is_decoded_for_display(self):
+        self.assertEqual(_ssid("4176656e676120436f72706f"), "Avenga Corpo")
+        self.assertEqual(_ssid("D0A2D0B5D181D182"), "Тест")
+
+    def test_hidden_and_plain_text_ssids_are_preserved(self):
+        self.assertEqual(_ssid(""), "<hidden>")
+        self.assertEqual(_ssid("Office Wi-Fi"), "Office Wi-Fi")
 
     def test_hidden_beacon_does_not_replace_learned_ssid(self):
         app = self.make_app()
@@ -92,6 +100,15 @@ class ReviewFixTests(unittest.TestCase):
         app._keys(Mock())
         self.assertEqual(app.filter, "ї")
 
+    def test_string_backspace_edits_filter(self):
+        screen = FakeScreen()
+        app = self.make_app(screen)
+        for backspace in ("\x7f", "\b"):
+            app.filter = "test"
+            screen.key = backspace
+            app._keys(Mock())
+            self.assertEqual(app.filter, "tes")
+
     def test_stale_access_points_sort_last_and_expire(self):
         app = self.make_app()
         now = time.monotonic()
@@ -105,6 +122,28 @@ class ReviewFixTests(unittest.TestCase):
     def test_short_hunt_layout_does_not_write_outside_screen(self):
         app = self.make_app(FakeScreen(height=8, width=50))
         app._draw_hunt(AccessPoint("AA", "Office", -50, 1, 2412))
+
+    @patch("fox80211.tui.curses.color_pair", return_value=0)
+    def test_hunt_controls_are_clipped_to_terminal_width(self, _color_pair):
+        screen = FakeScreen(height=15, width=50)
+        app = self.make_app(screen)
+        app._draw_hunt(AccessPoint("AA", "Office", -50, 1, 2412))
+        controls = [text for row, text, _ in screen.writes if row == 14]
+        self.assertEqual(len(controls), 1)
+        self.assertLessEqual(len(controls[0]), 47)
+
+    def test_expiry_covers_complete_channel_sweep(self):
+        self.assertGreater(scan_expiry(100), HOP_DWELL * 100)
+
+    def test_failed_frequency_is_removed_from_usable_set(self):
+        app = self.make_app()
+        app.usable_frequencies.add(2412)
+        app.stop_event.wait = Mock(side_effect=lambda _timeout: app.stop_event.set())
+        monitor = Mock()
+        monitor.set_frequency.side_effect = RuntimeError("tune failed")
+        app._hop(monitor, [(2412, 1)])
+        self.assertNotIn(2412, app.usable_frequencies)
+        self.assertEqual(app.rejected_frequencies[2412], "tune failed")
 
     @patch("fox80211.tui.curses.color_pair", return_value=0)
     def test_stale_hunt_displays_signal_lost(self, _color_pair):

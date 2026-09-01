@@ -14,6 +14,7 @@ from .sound import SoundBackend, TerminalBell
 STALE_AFTER = 10.0
 EXPIRE_AFTER = 30.0
 LOST_AFTER = 2.0
+HOP_DWELL = 0.35
 
 
 def select_adapter(screen: curses.window, adapters: list[Adapter]) -> Adapter:
@@ -62,10 +63,14 @@ class Application:
         self.current_frequency: int | None = None
         self.tune_error: str | None = None
         self.channel_by_frequency: dict[int, int] = {}
+        self.expire_after = EXPIRE_AFTER
 
     def run(self) -> None:
         frequencies = available_frequencies(self.adapter.phy)
         self.channel_by_frequency = dict(frequencies)
+        # Keep observations for longer than a complete sweep.  The extra dwell
+        # leaves room for tune and scheduling overhead between revisits.
+        self.expire_after = scan_expiry(len(frequencies))
         if not frequencies:
             raise RuntimeError("the PHY reports no enabled channels")
         with MonitorInterface(self.adapter) as monitor:
@@ -101,8 +106,9 @@ class Application:
                                 self.usable_frequencies.add(frequency)
                                 self.rejected_frequencies.pop(frequency, None)
                     except Exception as error:
+                        self.usable_frequencies.discard(frequency)
                         self.rejected_frequencies[frequency] = command_error(error)
-                    self.stop_event.wait(0.35)
+                    self.stop_event.wait(HOP_DWELL)
             else:
                 self.stop_event.wait(0.1)
 
@@ -120,7 +126,7 @@ class Application:
             else:
                 self.aps[bssid] = AccessPoint(bssid, ssid, rssi, channel, frequency, average=float(rssi), minimum=rssi, maximum=rssi)
         now = time.monotonic()
-        self.aps = {bssid: ap for bssid, ap in self.aps.items() if ap is self.hunt or now - ap.last_seen <= EXPIRE_AFTER}
+        self.aps = {bssid: ap for bssid, ap in self.aps.items() if ap is self.hunt or now - ap.last_seen <= self.expire_after}
 
     def _keys(self, monitor: MonitorInterface) -> None:
         try:
@@ -157,7 +163,7 @@ class Application:
                         except Exception as error:
                             self.tune_error = f"Unable to lock channel {target.channel or '?'}: {command_error(error)}"
                             self.hunt = None
-        elif key in (curses.KEY_BACKSPACE, 127, 8):
+        elif key in (curses.KEY_BACKSPACE, 127, 8, "\x7f", "\b"):
             self.filter = self.filter[:-1]
         elif isinstance(key, str) and key.isprintable():
             self.filter += key
@@ -212,7 +218,7 @@ class Application:
             self.screen.addstr(6, max(0, (terminal_width - 6) // 2), "-- dBm", curses.A_BOLD)
             self.screen.addstr(8, 2, "░" * width)
             self.screen.addstr(12, 2, f"last {age:5.2f}s")
-            self.screen.addstr(14, 2, f"[B] beep {'ON' if self.beep else 'off'} ({self.sound.name})   [R] reset   [Esc] scan   [Q] quit")
+            self._draw_hunt_controls(terminal_width)
             return
         label, color = proximity(smooth)
         width = max(10, min(50, terminal_width - 4))
@@ -227,10 +233,14 @@ class Application:
         maximum = ap.rssi if ap.maximum is None else ap.maximum
         self.screen.addstr(11, 2, f"current {ap.rssi:4}   avg {smooth:5.1f}   min {minimum:4}   max {maximum:4}")
         self.screen.addstr(12, 2, f"last {age:5.2f}s   samples {ap.samples}")
-        self.screen.addstr(14, 2, f"[B] beep {'ON' if self.beep else 'off'} ({self.sound.name})   [R] reset   [Esc] scan   [Q] quit")
+        self._draw_hunt_controls(terminal_width)
         if self.beep and time.monotonic() - self.last_beep >= beep_interval(smooth):
             self.sound.beep()
             self.last_beep = time.monotonic()
+
+    def _draw_hunt_controls(self, terminal_width: int) -> None:
+        controls = f"[B] beep {'ON' if self.beep else 'off'} ({self.sound.name})   [R] reset   [Esc] scan   [Q] quit"
+        self.screen.addnstr(14, 2, controls, max(0, terminal_width - 3))
 
 
 def command_error(error: Exception) -> str:
@@ -238,6 +248,10 @@ def command_error(error: Exception) -> str:
         stderr = (error.stderr or "").strip()
         return stderr.rsplit("\n", 1)[-1] if stderr else f"command exited {error.returncode}"
     return str(error)
+
+
+def scan_expiry(frequency_count: int) -> float:
+    return max(EXPIRE_AFTER, HOP_DWELL * (frequency_count + 1))
 
 
 def proximity(rssi: float) -> tuple[str, int]:

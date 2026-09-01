@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import string
 import queue
 import subprocess
 import tempfile
@@ -37,7 +38,7 @@ class TsharkCapture:
             try:
                 # Multiple antenna values are comma-separated; strongest is useful for hunting.
                 signals = [int(x) for x in row[2].split(",") if x]
-                self.events.put((row[0].upper(), row[1] or "<hidden>", max(signals), _integer(row[3]), _integer(row[4])))
+                self.events.put((row[0].upper(), _ssid(row[1]), max(signals), _integer(row[3]), _integer(row[4])))
             except ValueError:
                 continue
 
@@ -75,3 +76,16 @@ def _integer(value: str) -> int | None:
         return int(value.split(",")[0])
     except (ValueError, IndexError):
         return None
+
+
+def _ssid(value: str) -> str:
+    """Decode TShark's hexadecimal rendering of the raw SSID bytes."""
+    if not value:
+        return "<hidden>"
+    if len(value) % 2 == 0 and all(character in string.hexdigits for character in value):
+        decoded = bytes.fromhex(value).decode("utf-8", errors="replace")
+    else:
+        # Retain compatibility with TShark versions/output modes that return
+        # the already-decoded field value rather than its byte representation.
+        decoded = value
+    return "".join(character if character.isprintable() else "�" for character in decoded) or "<hidden>"
