@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import csv
 import queue
-import string
 import subprocess
 import tempfile
 import threading
@@ -118,18 +117,8 @@ def _ssid(value: str, raw_value: str = "") -> str:
             return "<hidden>"
         decoded = raw.decode("utf-8", errors="replace")
     else:
-        decoded = _hex_ssid(value) or value
+        # Without the raw field there is no reliable way to distinguish old
+        # TShark hex output from an SSID whose actual name contains only hex
+        # digits. Preserve the display field rather than changing valid names.
+        decoded = value
     return "".join(character if character.isprintable() else "�" for character in decoded) or "<hidden>"
-
-
-def _hex_ssid(value: str) -> str | None:
-    """Decode legacy TShark hex output when ``wlan.ssid_raw`` is unavailable."""
-    if not value or len(value) % 2 or not all(character in string.hexdigits for character in value):
-        return None
-    try:
-        decoded = bytes.fromhex(value).decode("utf-8")
-    except UnicodeDecodeError:
-        return None
-    # Avoid mistaking short hexadecimal-looking names (for example ``1234``)
-    # for bytes when decoding would only produce control characters.
-    return decoded if decoded and all(character.isprintable() for character in decoded) else None

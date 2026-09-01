@@ -51,9 +51,10 @@ class ReviewFixTests(unittest.TestCase):
         self.assertEqual(_ssid("4176656e676120436f72706f", "4176656e676120436f72706f"), "Avenga Corpo")
         self.assertEqual(_ssid("D0A2D0B5D181D182", "d0:a2:d0:b5:d1:81:d1:82"), "Тест")
 
-    def test_tshark_hex_ssid_is_decoded_without_optional_raw_field(self):
-        self.assertEqual(_ssid("4578616d706c6553534944"), "ExampleSSID")
-        self.assertEqual(_ssid("535349442de29c93"), "SSID-✓")
+    def test_hexadecimal_ssid_is_preserved_without_optional_raw_field(self):
+        self.assertEqual(_ssid("4142"), "4142")
+        self.assertEqual(_ssid("31323334"), "31323334")
+        self.assertEqual(_ssid("4578616d706c6553534944"), "4578616d706c6553534944")
 
     def test_hidden_and_plain_text_ssids_are_preserved(self):
         self.assertEqual(_ssid(""), "<hidden>")
