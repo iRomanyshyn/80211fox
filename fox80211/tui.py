@@ -7,7 +7,7 @@ import threading
 import time
 
 from .capture import TsharkCapture
-from .model import AccessPoint, Adapter
+from .model import RSSI_HISTORY_SECONDS, AccessPoint, Adapter
 from .system import MonitorInterface, available_frequencies
 from .sound import SoundBackend, TerminalBell
 
@@ -18,7 +18,7 @@ HOP_DWELL = 0.35
 HOP_TUNE_BUDGET = 0.1
 LOCK_RETRY_DELAY = 0.1
 LOCK_ATTEMPTS = 3
-SCAN_RSSI_WINDOW = 10.0
+SCAN_RSSI_WINDOW = RSSI_HISTORY_SECONDS
 
 
 def select_adapter(screen: curses.window, adapters: list[Adapter]) -> Adapter:

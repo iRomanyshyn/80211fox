@@ -29,6 +29,13 @@ class CoreTests(unittest.TestCase):
         ap.update(-20, 1, 2412)
         self.assertEqual(ap.recent_rssi(10.0, now=111.0), -30)
 
+    @patch("fox80211.model.time.monotonic", side_effect=[105.0, 111.0])
+    def test_update_prunes_rssi_history_without_rendering(self, monotonic):
+        ap = AccessPoint("00:00:00:00:00:00", "x", -60, 1, 2412, last_seen=90.0)
+        ap.update(-40, 1, 2412)
+        ap.update(-20, 1, 2412)
+        self.assertEqual(list(ap.rssi_history), [(105.0, -40), (111.0, -20)])
+
     def test_strength_drives_label_and_cadence(self):
         self.assertEqual(proximity(-80)[0], "WEAK")
         self.assertEqual(proximity(-30)[0], "VERY CLOSE")
