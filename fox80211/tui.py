@@ -18,6 +18,7 @@ HOP_DWELL = 0.35
 HOP_TUNE_BUDGET = 0.1
 LOCK_RETRY_DELAY = 0.1
 LOCK_ATTEMPTS = 3
+SCAN_RSSI_WINDOW = 10.0
 
 
 def select_adapter(screen: curses.window, adapters: list[Adapter]) -> Adapter:
@@ -193,7 +194,10 @@ class Application:
 
     def _visible(self) -> list[AccessPoint]:
         now = time.monotonic()
-        return sorted((ap for ap in self.aps.values() if ap.matches(self.filter)), key=lambda ap: (now - ap.last_seen >= STALE_AFTER, -ap.rssi))
+        return sorted(
+            (ap for ap in self.aps.values() if ap.matches(self.filter)),
+            key=lambda ap: (now - ap.last_seen >= STALE_AFTER, -ap.recent_rssi(SCAN_RSSI_WINDOW, now)),
+        )
 
     def _draw(self) -> None:
         self.screen.erase()
@@ -224,8 +228,10 @@ class Application:
         offset = min(max(0, self.selected - page_size + 1), max(0, len(visible) - page_size))
         for row, ap in enumerate(visible[offset : offset + page_size]):
             index = offset + row
-            age = time.monotonic() - ap.last_seen
-            line = f"{ap.rssi:4}  {str(ap.channel or '?'):>4}  {str(ap.frequency or '?'):>5}  {ap.bssid:17}  {ap.ssid:25.25}  {age:5.1f}s"
+            now = time.monotonic()
+            age = now - ap.last_seen
+            rssi = round(ap.recent_rssi(SCAN_RSSI_WINDOW, now))
+            line = f"{rssi:4}  {str(ap.channel or '?'):>4}  {str(ap.frequency or '?'):>5}  {ap.bssid:17}  {ap.ssid:25.25}  {age:5.1f}s"
             attr = curses.A_REVERSE if index == self.selected else (curses.A_DIM if age >= STALE_AFTER else 0)
             self.screen.addnstr(3 + row, 0, line, width - 1, attr)
         action = "resume" if self.paused else "pause"
