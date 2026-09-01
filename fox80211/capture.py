@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import csv
-import string
 import queue
 import subprocess
 import tempfile
@@ -11,7 +10,7 @@ import threading
 class TsharkCapture:
     """Thin, UI-independent stream of parsed beacon/probe-response observations."""
 
-    FIELDS = ("wlan.bssid", "wlan.ssid", "radiotap.dbm_antsignal", "wlan_radio.channel", "wlan_radio.frequency")
+    FIELDS = ("wlan.bssid", "wlan.ssid", "wlan.ssid_raw", "radiotap.dbm_antsignal", "wlan_radio.channel", "wlan_radio.frequency")
 
     def __init__(self, interface: str):
         self.interface = interface
@@ -33,12 +32,12 @@ class TsharkCapture:
     def _read(self) -> None:
         assert self.process and self.process.stdout
         for row in csv.reader(self.process.stdout, delimiter="\t"):
-            if len(row) != 5 or not row[0]:
+            if len(row) != 6 or not row[0]:
                 continue
             try:
                 # Multiple antenna values are comma-separated; strongest is useful for hunting.
-                signals = [int(x) for x in row[2].split(",") if x]
-                self.events.put((row[0].upper(), _ssid(row[1]), max(signals), _integer(row[3]), _integer(row[4])))
+                signals = [int(x) for x in row[3].split(",") if x]
+                self.events.put((row[0].upper(), _ssid(row[1], row[2]), max(signals), _integer(row[4]), _integer(row[5])))
             except ValueError:
                 continue
 
@@ -78,14 +77,20 @@ def _integer(value: str) -> int | None:
         return None
 
 
-def _ssid(value: str) -> str:
-    """Decode TShark's hexadecimal rendering of the raw SSID bytes."""
-    if not value:
+def _ssid(value: str, raw_value: str = "") -> str:
+    """Return a printable SSID, using the raw field to identify hex output."""
+    raw_hex = raw_value.replace(":", "")
+    if not value and not raw_hex:
         return "<hidden>"
-    if len(value) % 2 == 0 and all(character in string.hexdigits for character in value):
-        decoded = bytes.fromhex(value).decode("utf-8", errors="replace")
+
+    # Some TShark versions render non-UTF-8 wlan.ssid values as the same hex
+    # text exposed by wlan.ssid_raw.  Comparing the two fields distinguishes
+    # that representation from real SSIDs such as "Cafe" or "deadbeef".
+    if raw_hex and value.casefold() == raw_hex.casefold():
+        raw = bytes.fromhex(raw_hex)
+        if not raw or not any(raw):
+            return "<hidden>"
+        decoded = raw.decode("utf-8", errors="replace")
     else:
-        # Retain compatibility with TShark versions/output modes that return
-        # the already-decoded field value rather than its byte representation.
         decoded = value
     return "".join(character if character.isprintable() else "�" for character in decoded) or "<hidden>"
