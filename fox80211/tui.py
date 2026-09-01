@@ -59,6 +59,7 @@ class Application:
         self.selected = 0
         self.running = True
         self.hunt: AccessPoint | None = None
+        self.locking_hunt = False
         self.beep = False
         self.paused = False
         self.paused_at: float | None = None
@@ -121,6 +122,24 @@ class Application:
                         self.rejected_frequencies[frequency] = command_error(error)
                     self.stop_event.wait(HOP_DWELL)
             else:
+                target = self.hunt
+                if target is None:
+                    continue
+                try:
+                    with self.tune_lock:
+                        if self.hunt is not target:
+                            continue
+                        if self.current_frequency != target.frequency:
+                            self._lock_frequency(monitor, target.frequency)
+                        if self.hunt is target:
+                            self.current_frequency = target.frequency
+                            self.tune_error = None
+                            self.locking_hunt = False
+                except Exception as error:
+                    if self.hunt is target:
+                        self.tune_error = f"Unable to lock channel {target.channel or '?'}: {command_error(error)}"
+                        self.hunt = None
+                        self.locking_hunt = False
                 self.stop_event.wait(0.1)
 
     def _events(self, capture: TsharkCapture, apply: bool = True) -> None:
@@ -169,6 +188,7 @@ class Application:
         elif self.hunt:
             if key in (27, "\x1b"):
                 self.hunt = None
+                self.locking_hunt = False
             elif key in ("b", "B"):
                 self.beep = not self.beep
             elif key in ("r", "R"):
@@ -196,23 +216,14 @@ class Application:
                     # scan, so resume capture updates before locking the target.
                     self.paused = False
                     self.paused_at = None
-                    # Publish HUNT first, then wait for an outstanding hopping
-                    # tune before locking the target frequency.
+                    # Publish the request for the hopper, which is the sole
+                    # owner of channel changes.  In particular, do not retry a
+                    # busy driver from the UI thread: doing so stops event
+                    # draining and drawing for several seconds.
                     self.hunt = target
-                    with self.tune_lock:
-                        try:
-                            # The hopper may already have put the radio on the
-                            # selected AP.  Avoid a redundant nl80211 SET_WIPHY
-                            # request: a number of drivers report EBUSY while
-                            # capture is active even though the requested
-                            # channel is already locked.
-                            if self.current_frequency != target.frequency:
-                                self._lock_frequency(monitor, target.frequency)
-                            self.current_frequency = target.frequency
-                            self.tune_error = None
-                        except Exception as error:
-                            self.tune_error = f"Unable to lock channel {target.channel or '?'}: {command_error(error)}"
-                            self.hunt = None
+                    self.locking_hunt = self.current_frequency != target.frequency
+                    if not self.locking_hunt:
+                        self.tune_error = None
 
     def _lock_frequency(self, monitor: MonitorInterface, frequency: int) -> None:
         """Tune for hunt mode, retrying the driver's transient busy response."""
@@ -279,6 +290,11 @@ class Application:
         if height < 15 or terminal_width < 40:
             message = f"HUNT {ap.ssid} {ap.rssi} dBm — resize to at least 40x15"
             self.screen.addnstr(1, 0, message, terminal_width - 1, curses.A_BOLD)
+            return
+        if self.locking_hunt:
+            message = f"LOCKING CHANNEL {ap.channel or '?'} ({ap.frequency or '?'} MHz)"
+            self.screen.addstr(6, max(0, (terminal_width - len(message)) // 2), message, curses.A_BOLD)
+            self._draw_hunt_controls(terminal_width)
             return
         smooth = ap.average if ap.average is not None else ap.rssi
         age = time.monotonic() - ap.last_seen

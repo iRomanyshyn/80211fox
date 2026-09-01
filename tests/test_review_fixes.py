@@ -283,6 +283,8 @@ class ReviewFixTests(unittest.TestCase):
         monitor = Mock()
         monitor.set_frequency.side_effect = subprocess.CalledProcessError(1, ["iw"], stderr="Operation not permitted\n")
         app._keys(monitor)
+        app.stop_event.wait = Mock(side_effect=lambda _timeout: app.stop_event.set())
+        app._hop(monitor, [(5620, 124)])
         self.assertIsNone(app.hunt)
         self.assertEqual(app.tune_error, "Unable to lock channel 124: Operation not permitted")
         monitor.set_frequency.assert_called_once_with(5620)
@@ -298,12 +300,22 @@ class ReviewFixTests(unittest.TestCase):
         monitor.set_frequency.side_effect = [busy, None]
 
         app._keys(monitor)
+        waits = 0
+
+        def wait(_timeout):
+            nonlocal waits
+            waits += 1
+            if waits == 2:
+                app.stop_event.set()
+
+        app.stop_event.wait = Mock(side_effect=wait)
+        app._hop(monitor, [(5765, 153)])
 
         self.assertIs(app.hunt, app.aps["AA"])
         self.assertIsNone(app.tune_error)
         self.assertEqual(app.current_frequency, 5765)
         self.assertEqual(monitor.set_frequency.call_count, 2)
-        app.stop_event.wait.assert_called_once_with(0.1)
+        self.assertIn(0.1, [call.args[0] for call in app.stop_event.wait.call_args_list])
 
     def test_hunt_does_not_retune_frequency_already_locked_by_hopper(self):
         screen = FakeScreen()
@@ -319,6 +331,29 @@ class ReviewFixTests(unittest.TestCase):
         self.assertIsNone(app.tune_error)
         monitor.set_frequency.assert_not_called()
 
+    def test_hunt_lock_retries_do_not_block_ui_thread(self):
+        screen = FakeScreen()
+        screen.key = "\n"
+        app = self.make_app(screen)
+        app.aps["AA"] = AccessPoint("AA", "Office", -40, 153, 5765)
+        monitor = Mock()
+
+        app._keys(monitor)
+
+        self.assertIs(app.hunt, app.aps["AA"])
+        self.assertTrue(app.locking_hunt)
+        monitor.set_frequency.assert_not_called()
+
+    @patch("fox80211.tui.curses.color_pair", return_value=0)
+    def test_hunt_shows_locking_state_instead_of_stale_signal(self, _color_pair):
+        screen = FakeScreen()
+        app = self.make_app(screen)
+        app.locking_hunt = True
+        app._draw_hunt(AccessPoint("AA", "Office", -31, 153, 5765, last_seen=time.monotonic() - 3))
+        rendered = " ".join(text for _, text, _ in screen.writes)
+        self.assertIn("LOCKING CHANNEL 153", rendered)
+        self.assertNotIn("SIGNAL LOST", rendered)
+
     def test_persistent_busy_hunt_tune_reports_error_after_retries(self):
         screen = FakeScreen()
         screen.key = "\n"
@@ -331,6 +366,8 @@ class ReviewFixTests(unittest.TestCase):
         )
 
         app._keys(monitor)
+        app.stop_event.wait = Mock(side_effect=lambda _timeout: app.stop_event.set())
+        app._hop(monitor, [(5765, 153)])
 
         self.assertIsNone(app.hunt)
         self.assertIn("Device or resource busy", app.tune_error)
