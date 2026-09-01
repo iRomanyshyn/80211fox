@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -20,6 +21,16 @@ class CoreTests(unittest.TestCase):
         ap = AccessPoint("00:00:00:00:00:00", "x", -60, 1, 2412, average=-60)
         ap.update(-40, 1, 2412)
         self.assertEqual(ap.average, -55)
+
+    @patch("fox80211.model.time.monotonic", side_effect=[5.0, 12.0, 16.0])
+    def test_recent_signal_average_uses_time_window(self, _monotonic):
+        ap = AccessPoint("00:00:00:00:00:00", "x", -60, 1, 2412, last_seen=0.0)
+        ap.update(-40, 1, 2412)
+        ap.update(-50, 1, 2412)
+
+        self.assertEqual(ap.recent_average(10.0, now=12.0), -45)
+        ap.update(-30, 1, 2412)
+        self.assertEqual(ap.recent_average(10.0, now=16.0), -40)
 
     def test_strength_drives_label_and_cadence(self):
         self.assertEqual(proximity(-80)[0], "WEAK")
