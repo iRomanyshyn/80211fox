@@ -22,11 +22,13 @@ class TsharkCapture:
         self.stderr = tempfile.TemporaryFile(mode="w+t")
         self.stopping = False
         self.fields = self.FIELDS
+        self.ssid_is_bytes = False
 
     def start(self) -> None:
         supported = _tshark_fields()
         optional = tuple(field for field in self.OPTIONAL_FIELDS if field in supported)
         self.fields = self.FIELDS + optional
+        self.ssid_is_bytes = supported.get("wlan.ssid") == "FT_BYTES"
         args = ["tshark", "-l", "-n", "-i", self.interface, "-Y", "wlan.fc.type_subtype == 8 || wlan.fc.type_subtype == 5", "-T", "fields"]
         for field in self.fields:
             args += ["-e", field]
@@ -44,7 +46,15 @@ class TsharkCapture:
                 # Multiple antenna values are comma-separated; strongest is useful for hunting.
                 signals = [int(x) for x in row[2].split(",") if x]
                 raw_ssid = row[5] if "wlan.ssid_raw" in self.fields else ""
-                self.events.put((row[0].upper(), _ssid(row[1], raw_ssid), max(signals), _integer(row[3]), _integer(row[4])))
+                self.events.put(
+                    (
+                        row[0].upper(),
+                        _ssid(row[1], raw_ssid, self.ssid_is_bytes),
+                        max(signals),
+                        _integer(row[3]),
+                        _integer(row[4]),
+                    )
+                )
             except ValueError:
                 continue
 
@@ -77,8 +87,8 @@ class TsharkCapture:
         raise RuntimeError(f"tshark capture stopped: {message}")
 
 
-def _tshark_fields() -> set[str]:
-    """Return fields advertised by this TShark, or no optional fields on failure."""
+def _tshark_fields() -> dict[str, str]:
+    """Return advertised field names and types, or no fields on failure."""
     try:
         result = subprocess.run(
             ["tshark", "-G", "fields"],
@@ -89,13 +99,13 @@ def _tshark_fields() -> set[str]:
             timeout=5,
         )
     except (OSError, subprocess.SubprocessError):
-        return set()
+        return {}
     if result.returncode:
-        return set()
+        return {}
     return {
-        columns[2]
+        columns[2]: columns[3]
         for line in result.stdout.splitlines()
-        if len(columns := line.split("\t")) > 2 and columns[0] == "F"
+        if len(columns := line.split("\t")) > 3 and columns[0] == "F"
     }
 
 
@@ -106,16 +116,16 @@ def _integer(value: str) -> int | None:
         return None
 
 
-def _ssid(value: str, raw_value: str = "") -> str:
+def _ssid(value: str, raw_value: str = "", value_is_bytes: bool = False) -> str:
     """Decode the SSID octets emitted by TShark into safe display text.
 
-    ``wlan.ssid`` is an FT_BYTES field and is therefore normally rendered as
-    hexadecimal, despite its name.  Some TShark versions also expose the same
-    bytes as ``wlan.ssid_raw`` while others do not.  Treating the former as
-    already-decoded text is what produced long numeric strings in the UI.
+    TShark builds disagree about whether ``wlan.ssid`` is a text or byte field.
+    Decode it only when field discovery reports ``FT_BYTES``; otherwise an SSID
+    such as ``Cafe`` or ``1234`` is indistinguishable from hexadecimal bytes.
+    When available, ``wlan.ssid_raw`` is unambiguously byte-formatted.
     """
-    encoded = raw_value or value
-    raw = _ssid_bytes(encoded)
+    encoded = raw_value if raw_value else value
+    raw = _ssid_bytes(encoded) if raw_value or value_is_bytes else None
     if raw is None:
         # Be tolerant of versions/builds which render wlan.ssid as text.
         decoded = value
