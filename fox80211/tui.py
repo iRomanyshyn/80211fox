@@ -17,7 +17,7 @@ LOST_AFTER = 2.0
 HOP_DWELL = 0.35
 HOP_TUNE_BUDGET = 0.1
 LOCK_RETRY_DELAY = 0.1
-LOCK_ATTEMPTS = 3
+LOCK_ATTEMPTS = 20
 SCAN_RSSI_WINDOW = RSSI_HISTORY_SECONDS
 
 
@@ -201,7 +201,13 @@ class Application:
                     self.hunt = target
                     with self.tune_lock:
                         try:
-                            self._lock_frequency(monitor, target.frequency)
+                            # The hopper may already have put the radio on the
+                            # selected AP.  Avoid a redundant nl80211 SET_WIPHY
+                            # request: a number of drivers report EBUSY while
+                            # capture is active even though the requested
+                            # channel is already locked.
+                            if self.current_frequency != target.frequency:
+                                self._lock_frequency(monitor, target.frequency)
                             self.current_frequency = target.frequency
                             self.tune_error = None
                         except Exception as error:

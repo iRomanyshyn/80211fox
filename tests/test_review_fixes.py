@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 from fox80211.capture import TsharkCapture, _ssid, _tshark_fields
 from fox80211.model import AccessPoint, Adapter
 from fox80211.system import MonitorInterface, _interface_associated, available_frequencies
-from fox80211.tui import HOP_DWELL, HOP_TUNE_BUDGET, Application, scan_expiry
+from fox80211.tui import HOP_DWELL, HOP_TUNE_BUDGET, LOCK_ATTEMPTS, Application, scan_expiry
 
 
 class FakeScreen:
@@ -305,6 +305,20 @@ class ReviewFixTests(unittest.TestCase):
         self.assertEqual(monitor.set_frequency.call_count, 2)
         app.stop_event.wait.assert_called_once_with(0.1)
 
+    def test_hunt_does_not_retune_frequency_already_locked_by_hopper(self):
+        screen = FakeScreen()
+        screen.key = "\n"
+        app = self.make_app(screen)
+        app.aps["AA"] = AccessPoint("AA", "Office", -40, 1, 2412)
+        app.current_frequency = 2412
+        monitor = Mock()
+
+        app._keys(monitor)
+
+        self.assertIs(app.hunt, app.aps["AA"])
+        self.assertIsNone(app.tune_error)
+        monitor.set_frequency.assert_not_called()
+
     def test_persistent_busy_hunt_tune_reports_error_after_retries(self):
         screen = FakeScreen()
         screen.key = "\n"
@@ -320,7 +334,7 @@ class ReviewFixTests(unittest.TestCase):
 
         self.assertIsNone(app.hunt)
         self.assertIn("Device or resource busy", app.tune_error)
-        self.assertEqual(monitor.set_frequency.call_count, 3)
+        self.assertEqual(monitor.set_frequency.call_count, LOCK_ATTEMPTS)
 
     def test_hunt_without_known_frequency_returns_to_scan_with_error(self):
         screen = FakeScreen()
