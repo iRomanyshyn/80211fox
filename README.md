@@ -76,9 +76,13 @@ settings may suppress or render visually); `--sound off` disables sound.
 
 ## Controls
 
-In SCAN, type to filter by partial case-insensitive SSID or BSSID; punctuation
-and case in MAC addresses are ignored. Backspace edits, arrows select, and
-Enter starts HUNT. In HUNT, `B` toggles cadence beeps, `R` resets statistics,
+In SCAN, press `F` to open the highlighted filter field, then type to filter
+dynamically by partial case-insensitive SSID or BSSID; punctuation and case in
+MAC addresses are ignored. `Space` and `Q` are ordinary filter characters while
+the field is active. Backspace edits, Enter commits the filter, Escape cancels
+the edit, arrows select, and Enter starts HUNT outside the filter field. Space
+freezes or resumes the scan, including its access-point values and ordering. In
+HUNT, `B` toggles cadence beeps, `R` resets statistics,
 Escape returns to scanning, and `Q` quits. After two seconds without the target,
 beeps stop and HUNT displays `SIGNAL LOST` instead of stale strength. SCAN dims
 observations after ten seconds, sorts them behind live APs, and removes them
