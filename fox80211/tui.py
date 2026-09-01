@@ -5,6 +5,7 @@ import queue
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 
 from .capture import TsharkCapture
 from .model import RSSI_HISTORY_SECONDS, AccessPoint, Adapter
@@ -129,12 +130,24 @@ class Application:
                     with self.tune_lock:
                         if self.hunt is not target:
                             continue
-                        if self.current_frequency != target.frequency:
-                            self._lock_frequency(monitor, target.frequency)
+                        # Capture the requested frequency while we own the
+                        # radio. Capture events may update the target while an
+                        # external tuning command is in progress.
+                        requested_frequency = target.frequency
+                        self.locking_hunt = self.current_frequency != requested_frequency
+                        if self.locking_hunt and not self._lock_frequency(
+                            monitor,
+                            requested_frequency,
+                            cancelled=lambda: self.stop_event.is_set() or self.hunt is not target,
+                        ):
+                            continue
                         if self.hunt is target:
-                            self.current_frequency = target.frequency
+                            self.current_frequency = requested_frequency
                             self.tune_error = None
-                            self.locking_hunt = False
+                            # If capture learned a new channel while `iw` was
+                            # running, keep the locking view visible until the
+                            # next iteration tunes that newer frequency.
+                            self.locking_hunt = target.frequency != requested_frequency
                 except Exception as error:
                     if self.hunt is target:
                         self.tune_error = f"Unable to lock channel {target.channel or '?'}: {command_error(error)}"
@@ -221,20 +234,26 @@ class Application:
                     # busy driver from the UI thread: doing so stops event
                     # draining and drawing for several seconds.
                     self.hunt = target
-                    self.locking_hunt = self.current_frequency != target.frequency
-                    if not self.locking_hunt:
-                        self.tune_error = None
+                    # Treat the request as locking until the hopper acquires
+                    # tune_lock and verifies which frequency the radio is
+                    # actually using.
+                    self.locking_hunt = True
 
-    def _lock_frequency(self, monitor: MonitorInterface, frequency: int) -> None:
+    def _lock_frequency(
+        self, monitor: MonitorInterface, frequency: int, cancelled: Callable[[], bool] | None = None
+    ) -> bool:
         """Tune for hunt mode, retrying the driver's transient busy response."""
         for attempt in range(LOCK_ATTEMPTS):
+            if cancelled is not None and cancelled():
+                return False
             try:
                 monitor.set_frequency(frequency)
-                return
+                return True
             except subprocess.CalledProcessError as error:
                 if not frequency_is_busy(error) or attempt == LOCK_ATTEMPTS - 1:
                     raise
                 self.stop_event.wait(LOCK_RETRY_DELAY)
+        return False
 
     def _visible(self) -> list[AccessPoint]:
         now = self.paused_at if self.paused_at is not None else time.monotonic()

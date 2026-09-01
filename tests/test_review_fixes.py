@@ -328,6 +328,13 @@ class ReviewFixTests(unittest.TestCase):
         app._keys(monitor)
 
         self.assertIs(app.hunt, app.aps["AA"])
+        self.assertTrue(app.locking_hunt)
+        monitor.set_frequency.assert_not_called()
+
+        app.stop_event.wait = Mock(side_effect=lambda _timeout: app.stop_event.set())
+        app._hop(monitor, [(2412, 1)])
+
+        self.assertFalse(app.locking_hunt)
         self.assertIsNone(app.tune_error)
         monitor.set_frequency.assert_not_called()
 
@@ -366,12 +373,69 @@ class ReviewFixTests(unittest.TestCase):
         )
 
         app._keys(monitor)
-        app.stop_event.wait = Mock(side_effect=lambda _timeout: app.stop_event.set())
+        waits = 0
+
+        def wait(_timeout):
+            nonlocal waits
+            waits += 1
+            if waits == LOCK_ATTEMPTS:
+                app.stop_event.set()
+
+        app.stop_event.wait = Mock(side_effect=wait)
         app._hop(monitor, [(5765, 153)])
 
         self.assertIsNone(app.hunt)
         self.assertIn("Device or resource busy", app.tune_error)
         self.assertEqual(monitor.set_frequency.call_count, LOCK_ATTEMPTS)
+
+    def test_cancelled_hunt_aborts_busy_retries(self):
+        app = self.make_app()
+        target = AccessPoint("AA", "Office", -40, 153, 5765)
+        app.hunt = target
+        app.locking_hunt = True
+        monitor = Mock()
+        monitor.set_frequency.side_effect = subprocess.CalledProcessError(
+            1, ["iw"], stderr="command failed: Device or resource busy (-16)\n"
+        )
+        app.stop_event.wait = Mock(side_effect=lambda _timeout: setattr(app, "hunt", None))
+
+        locked = app._lock_frequency(monitor, target.frequency, cancelled=lambda: app.hunt is not target)
+
+        self.assertFalse(locked)
+        self.assertIsNone(app.hunt)
+        self.assertEqual(monitor.set_frequency.call_count, 1)
+
+    def test_hunt_records_frequency_requested_before_target_update(self):
+        app = self.make_app()
+        target = AccessPoint("AA", "Office", -40, 1, 2412)
+        app.hunt = target
+        app.locking_hunt = True
+        monitor = Mock()
+
+        def tune(_frequency):
+            target.update(-39, 6, 2437)
+
+        monitor.set_frequency.side_effect = tune
+        app.stop_event.wait = Mock(side_effect=lambda _timeout: app.stop_event.set())
+
+        app._hop(monitor, [(2412, 1)])
+
+        monitor.set_frequency.assert_called_once_with(2412)
+        self.assertEqual(app.current_frequency, 2412)
+        self.assertEqual(target.frequency, 2437)
+        self.assertTrue(app.locking_hunt)
+
+    def test_hunt_stays_locking_until_in_progress_scan_tune_finishes(self):
+        screen = FakeScreen()
+        screen.key = "\n"
+        app = self.make_app(screen)
+        target = AccessPoint("AA", "Office", -40, 1, 2412)
+        app.aps[target.bssid] = target
+        app.current_frequency = target.frequency
+
+        app._keys(Mock())
+
+        self.assertTrue(app.locking_hunt)
 
     def test_hunt_without_known_frequency_returns_to_scan_with_error(self):
         screen = FakeScreen()
