@@ -51,10 +51,15 @@ class ReviewFixTests(unittest.TestCase):
         self.assertEqual(_ssid("4176656e676120436f72706f", "4176656e676120436f72706f"), "Avenga Corpo")
         self.assertEqual(_ssid("D0A2D0B5D181D182", "d0:a2:d0:b5:d1:81:d1:82"), "Тест")
 
-    def test_hexadecimal_ssid_is_decoded_without_optional_raw_field(self):
-        self.assertEqual(_ssid("4142"), "AB")
-        self.assertEqual(_ssid("31323334"), "1234")
-        self.assertEqual(_ssid("4578616d706c6553534944"), "ExampleSSID")
+    def test_hexadecimal_ssid_is_decoded_when_display_field_is_bytes(self):
+        self.assertEqual(_ssid("4142", value_is_bytes=True), "AB")
+        self.assertEqual(_ssid("31323334", value_is_bytes=True), "1234")
+        self.assertEqual(_ssid("4578616d706c6553534944", value_is_bytes=True), "ExampleSSID")
+
+    def test_ambiguous_hexadecimal_text_ssids_are_preserved(self):
+        self.assertEqual(_ssid("Cafe"), "Cafe")
+        self.assertEqual(_ssid("1234"), "1234")
+        self.assertEqual(_ssid("0000"), "0000")
 
     def test_hidden_and_plain_text_ssids_are_preserved(self):
         self.assertEqual(_ssid(""), "<hidden>")
@@ -64,12 +69,12 @@ class ReviewFixTests(unittest.TestCase):
         self.assertEqual(_ssid("Cafe", "43616665"), "Cafe")
         self.assertEqual(_ssid("1234", "31323334"), "1234")
         self.assertEqual(_ssid("deadbeef", "6465616462656566"), "deadbeef")
-        self.assertEqual(_ssid("31323334"), "1234")
+        self.assertEqual(_ssid("31323334"), "31323334")
 
     def test_text_rendering_and_malformed_hex_are_tolerated(self):
         self.assertEqual(_ssid("Office Wi-Fi"), "Office Wi-Fi")
         self.assertEqual(_ssid("abc"), "abc")
-        self.assertEqual(_ssid("0x43616665"), "Cafe")
+        self.assertEqual(_ssid("0x43616665", value_is_bytes=True), "Cafe")
 
     def test_raw_ssid_is_authoritative_when_display_field_is_hex_or_wrong(self):
         self.assertEqual(_ssid("43616665", "3433363136363635"), "43616665")
@@ -232,10 +237,10 @@ class ReviewFixTests(unittest.TestCase):
             returncode=0,
             stdout="F\tSSID\twlan.ssid\tFT_STRING\twlan\nF\tRaw SSID\twlan.ssid_raw\tFT_BYTES\twlan\n",
         )
-        self.assertEqual(_tshark_fields(), {"wlan.ssid", "wlan.ssid_raw"})
+        self.assertEqual(_tshark_fields(), {"wlan.ssid": "FT_STRING", "wlan.ssid_raw": "FT_BYTES"})
 
     @patch("fox80211.capture.subprocess.Popen")
-    @patch("fox80211.capture._tshark_fields", return_value={"wlan.ssid"})
+    @patch("fox80211.capture._tshark_fields", return_value={"wlan.ssid": "FT_STRING"})
     def test_capture_omits_raw_ssid_when_tshark_does_not_support_it(self, _fields, popen):
         process = popen.return_value
         process.stdout = iter(())
@@ -247,7 +252,7 @@ class ReviewFixTests(unittest.TestCase):
         capture.stderr.close()
 
     @patch("fox80211.capture.subprocess.Popen")
-    @patch("fox80211.capture._tshark_fields", return_value={"wlan.ssid_raw"})
+    @patch("fox80211.capture._tshark_fields", return_value={"wlan.ssid_raw": "FT_BYTES"})
     def test_capture_uses_raw_ssid_when_tshark_supports_it(self, _fields, popen):
         process = popen.return_value
         process.stdout = iter(())
