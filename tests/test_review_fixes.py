@@ -1,3 +1,4 @@
+from collections import deque
 import curses
 import queue
 import subprocess
@@ -103,6 +104,21 @@ class ReviewFixTests(unittest.TestCase):
         highlighted = [text for _, text, attr in screen.writes if attr == curses.A_REVERSE]
         self.assertEqual(len(highlighted), 1)
         self.assertIn("00:00:00:00:00:08", highlighted[0])
+
+    def test_scan_displays_and_sorts_by_recent_average(self):
+        screen = FakeScreen()
+        app = self.make_app(screen)
+        now = time.monotonic()
+        steady = AccessPoint("00:00:00:00:00:01", "steady", -50, 1, 2412, last_seen=now)
+        noisy = AccessPoint("00:00:00:00:00:02", "noisy", -80, 1, 2412, last_seen=now)
+        steady.rssi_history = deque([(now - 1, -50), (now, -50)])
+        noisy.rssi_history = deque([(now - 1, -10), (now, -80)])
+        app.aps = {steady.bssid: steady, noisy.bssid: noisy}
+
+        self.assertEqual([ap.ssid for ap in app._visible()], ["noisy", "steady"])
+        app._draw_scan()
+        rows = [text for row, text, _ in screen.writes if row >= 3 and "00:00:00:00:00:" in text]
+        self.assertTrue(rows[0].startswith(" -45"))
 
     def test_scan_reserves_last_row_for_controls(self):
         screen = FakeScreen(height=8)

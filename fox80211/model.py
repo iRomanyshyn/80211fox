@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 import time
 
@@ -32,16 +33,31 @@ class AccessPoint:
     average: float | None = None
     minimum: int | None = None
     maximum: int | None = None
+    rssi_history: deque[tuple[float, int]] = field(default_factory=deque)
+
+    def __post_init__(self) -> None:
+        if not self.rssi_history:
+            self.rssi_history.append((self.last_seen, self.rssi))
 
     def update(self, rssi: int, channel: int | None, frequency: int | None) -> None:
         self.rssi = rssi
         self.channel = channel or self.channel
         self.frequency = frequency or self.frequency
         self.last_seen = time.monotonic()
+        self.rssi_history.append((self.last_seen, rssi))
         self.samples += 1
         self.average = rssi if self.average is None else 0.25 * rssi + 0.75 * self.average
         self.minimum = rssi if self.minimum is None else min(self.minimum, rssi)
         self.maximum = rssi if self.maximum is None else max(self.maximum, rssi)
+
+    def recent_rssi(self, seconds: float, now: float | None = None) -> float:
+        """Return the mean RSSI observed within the rolling time window."""
+        now = time.monotonic() if now is None else now
+        cutoff = now - seconds
+        while len(self.rssi_history) > 1 and self.rssi_history[0][0] < cutoff:
+            self.rssi_history.popleft()
+        samples = [rssi for timestamp, rssi in self.rssi_history if timestamp >= cutoff]
+        return sum(samples) / len(samples) if samples else float(self.rssi)
 
     def matches(self, query: str) -> bool:
         query = query.strip().casefold()
