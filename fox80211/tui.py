@@ -16,6 +16,8 @@ EXPIRE_AFTER = 30.0
 LOST_AFTER = 2.0
 HOP_DWELL = 0.35
 HOP_TUNE_BUDGET = 0.1
+LOCK_RETRY_DELAY = 0.1
+LOCK_ATTEMPTS = 3
 
 
 def select_adapter(screen: curses.window, adapters: list[Adapter]) -> Adapter:
@@ -55,6 +57,7 @@ class Application:
         self.running = True
         self.hunt: AccessPoint | None = None
         self.beep = False
+        self.paused = False
         self.last_beep = 0.0
         self.stop_event = threading.Event()
         self.tune_lock = threading.Lock()
@@ -95,9 +98,12 @@ class Application:
 
     def _hop(self, monitor: MonitorInterface, frequencies: list[tuple[int, int]]) -> None:
         while not self.stop_event.is_set():
+            if self.paused:
+                self.stop_event.wait(0.1)
+                continue
             if self.hunt is None:
                 for frequency, _ in frequencies:
-                    if self.stop_event.is_set() or self.hunt is not None:
+                    if self.stop_event.is_set() or self.hunt is not None or self.paused:
                         break
                     try:
                         with self.tune_lock:
@@ -144,6 +150,8 @@ class Application:
             elif key in ("r", "R"):
                 ap = self.hunt
                 ap.samples, ap.minimum, ap.maximum, ap.average = 1, ap.rssi, ap.rssi, float(ap.rssi)
+        elif key == " ":
+            self.paused = not self.paused
         elif key == curses.KEY_UP:
             self.selected = max(0, self.selected - 1)
         elif key == curses.KEY_DOWN:
@@ -161,7 +169,7 @@ class Application:
                     self.hunt = target
                     with self.tune_lock:
                         try:
-                            monitor.set_frequency(target.frequency)
+                            self._lock_frequency(monitor, target.frequency)
                             self.current_frequency = target.frequency
                             self.tune_error = None
                         except Exception as error:
@@ -171,6 +179,17 @@ class Application:
             self.filter = self.filter[:-1]
         elif isinstance(key, str) and key.isprintable():
             self.filter += key
+
+    def _lock_frequency(self, monitor: MonitorInterface, frequency: int) -> None:
+        """Tune for hunt mode, retrying the driver's transient busy response."""
+        for attempt in range(LOCK_ATTEMPTS):
+            try:
+                monitor.set_frequency(frequency)
+                return
+            except subprocess.CalledProcessError as error:
+                if not frequency_is_busy(error) or attempt == LOCK_ATTEMPTS - 1:
+                    raise
+                self.stop_event.wait(LOCK_RETRY_DELAY)
 
     def _visible(self) -> list[AccessPoint]:
         now = time.monotonic()
@@ -190,7 +209,8 @@ class Application:
         self.screen.refresh()
 
     def _draw_scan(self) -> None:
-        self.screen.addstr(0, 0, f"SCAN  {self.adapter.interface}/{self.adapter.phy}   filter: {self.filter}_", curses.A_BOLD)
+        state = "PAUSED" if self.paused else "SCANNING"
+        self.screen.addstr(0, 0, f"{state}  {self.adapter.interface}/{self.adapter.phy}   filter: {self.filter}_", curses.A_BOLD)
         total = len(self.channel_by_frequency)
         current = self.channel_by_frequency.get(self.current_frequency or 0, "?")
         self.screen.addstr(1, 0, f"Channels: {total} available / {len(self.usable_frequencies)} usable / {len(self.rejected_frequencies)} rejected   Current: {current} ({self.current_frequency or '?'} MHz)")
@@ -199,14 +219,17 @@ class Application:
             self.screen.addnstr(1, 0, self.tune_error, self.screen.getmaxyx()[1] - 1, curses.A_BOLD)
         visible = self._visible()
         self.selected = min(self.selected, max(0, len(visible) - 1))
-        page_size = max(1, self.screen.getmaxyx()[0] - 3)
+        height, width = self.screen.getmaxyx()
+        page_size = max(0, height - 4)
         offset = min(max(0, self.selected - page_size + 1), max(0, len(visible) - page_size))
         for row, ap in enumerate(visible[offset : offset + page_size]):
             index = offset + row
             age = time.monotonic() - ap.last_seen
             line = f"{ap.rssi:4}  {str(ap.channel or '?'):>4}  {str(ap.frequency or '?'):>5}  {ap.bssid:17}  {ap.ssid:25.25}  {age:5.1f}s"
             attr = curses.A_REVERSE if index == self.selected else (curses.A_DIM if age >= STALE_AFTER else 0)
-            self.screen.addnstr(3 + row, 0, line, self.screen.getmaxyx()[1] - 1, attr)
+            self.screen.addnstr(3 + row, 0, line, width - 1, attr)
+        action = "resume" if self.paused else "pause"
+        self.screen.addnstr(height - 1, 0, f"[Space] {action}   [Enter] hunt selected network   [Q] quit", width - 1, curses.A_BOLD)
 
     def _draw_hunt(self, ap: AccessPoint) -> None:
         height, terminal_width = self.screen.getmaxyx()
@@ -252,6 +275,12 @@ def command_error(error: Exception) -> str:
         stderr = (error.stderr or "").strip()
         return stderr.rsplit("\n", 1)[-1] if stderr else f"command exited {error.returncode}"
     return str(error)
+
+
+def frequency_is_busy(error: subprocess.CalledProcessError) -> bool:
+    """Recognize the transient EBUSY responses produced by iw/nl80211."""
+    detail = f"{error.stdout or ''}\n{error.stderr or ''}".casefold()
+    return "device or resource busy" in detail or "(-16)" in detail
 
 
 def scan_expiry(frequency_count: int) -> float:
