@@ -16,6 +16,8 @@ EXPIRE_AFTER = 30.0
 LOST_AFTER = 2.0
 HOP_DWELL = 0.35
 HOP_TUNE_BUDGET = 0.1
+LOCK_RETRY_DELAY = 0.1
+LOCK_ATTEMPTS = 3
 
 
 def select_adapter(screen: curses.window, adapters: list[Adapter]) -> Adapter:
@@ -167,7 +169,7 @@ class Application:
                     self.hunt = target
                     with self.tune_lock:
                         try:
-                            monitor.set_frequency(target.frequency)
+                            self._lock_frequency(monitor, target.frequency)
                             self.current_frequency = target.frequency
                             self.tune_error = None
                         except Exception as error:
@@ -177,6 +179,17 @@ class Application:
             self.filter = self.filter[:-1]
         elif isinstance(key, str) and key.isprintable():
             self.filter += key
+
+    def _lock_frequency(self, monitor: MonitorInterface, frequency: int) -> None:
+        """Tune for hunt mode, retrying the driver's transient busy response."""
+        for attempt in range(LOCK_ATTEMPTS):
+            try:
+                monitor.set_frequency(frequency)
+                return
+            except subprocess.CalledProcessError as error:
+                if not frequency_is_busy(error) or attempt == LOCK_ATTEMPTS - 1:
+                    raise
+                self.stop_event.wait(LOCK_RETRY_DELAY)
 
     def _visible(self) -> list[AccessPoint]:
         now = time.monotonic()
@@ -262,6 +275,12 @@ def command_error(error: Exception) -> str:
         stderr = (error.stderr or "").strip()
         return stderr.rsplit("\n", 1)[-1] if stderr else f"command exited {error.returncode}"
     return str(error)
+
+
+def frequency_is_busy(error: subprocess.CalledProcessError) -> bool:
+    """Recognize the transient EBUSY responses produced by iw/nl80211."""
+    detail = f"{error.stdout or ''}\n{error.stderr or ''}".casefold()
+    return "device or resource busy" in detail or "(-16)" in detail
 
 
 def scan_expiry(frequency_count: int) -> float:

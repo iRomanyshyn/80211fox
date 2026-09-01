@@ -216,6 +216,42 @@ class ReviewFixTests(unittest.TestCase):
         app._keys(monitor)
         self.assertIsNone(app.hunt)
         self.assertEqual(app.tune_error, "Unable to lock channel 124: Operation not permitted")
+        monitor.set_frequency.assert_called_once_with(5620)
+
+    def test_busy_hunt_tune_is_retried(self):
+        screen = FakeScreen()
+        screen.key = "\n"
+        app = self.make_app(screen)
+        app.stop_event.wait = Mock(return_value=False)
+        app.aps["AA"] = AccessPoint("AA", "Office", -40, 153, 5765)
+        monitor = Mock()
+        busy = subprocess.CalledProcessError(1, ["iw"], stderr="command failed: Device or resource busy (-16)\n")
+        monitor.set_frequency.side_effect = [busy, None]
+
+        app._keys(monitor)
+
+        self.assertIs(app.hunt, app.aps["AA"])
+        self.assertIsNone(app.tune_error)
+        self.assertEqual(app.current_frequency, 5765)
+        self.assertEqual(monitor.set_frequency.call_count, 2)
+        app.stop_event.wait.assert_called_once_with(0.1)
+
+    def test_persistent_busy_hunt_tune_reports_error_after_retries(self):
+        screen = FakeScreen()
+        screen.key = "\n"
+        app = self.make_app(screen)
+        app.stop_event.wait = Mock(return_value=False)
+        app.aps["AA"] = AccessPoint("AA", "Office", -40, 153, 5765)
+        monitor = Mock()
+        monitor.set_frequency.side_effect = subprocess.CalledProcessError(
+            1, ["iw"], stderr="command failed: Device or resource busy (-16)\n"
+        )
+
+        app._keys(monitor)
+
+        self.assertIsNone(app.hunt)
+        self.assertIn("Device or resource busy", app.tune_error)
+        self.assertEqual(monitor.set_frequency.call_count, 3)
 
     def test_hunt_without_known_frequency_returns_to_scan_with_error(self):
         screen = FakeScreen()
