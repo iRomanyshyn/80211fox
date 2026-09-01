@@ -5,7 +5,7 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
-from fox80211.capture import TsharkCapture, _ssid
+from fox80211.capture import TsharkCapture, _ssid, _tshark_fields
 from fox80211.model import AccessPoint, Adapter
 from fox80211.system import MonitorInterface, _interface_associated, available_frequencies
 from fox80211.tui import HOP_DWELL, HOP_TUNE_BUDGET, Application, scan_expiry
@@ -82,6 +82,16 @@ class ReviewFixTests(unittest.TestCase):
         highlighted = [text for _, text, attr in screen.writes if attr == curses.A_REVERSE]
         self.assertEqual(len(highlighted), 1)
         self.assertIn("00:00:00:00:00:08", highlighted[0])
+
+    def test_scan_uses_every_row_below_three_line_header(self):
+        screen = FakeScreen(height=8)
+        app = self.make_app(screen)
+        for index in range(10):
+            bssid = f"00:00:00:00:00:{index:02X}"
+            app.aps[bssid] = AccessPoint(bssid, str(index), -30 - index, 1, 2412)
+        app._draw_scan()
+        access_point_rows = [row for row, text, _ in screen.writes if row >= 3 and "00:00:00:00:00:" in text]
+        self.assertEqual(access_point_rows, list(range(3, screen.height)))
 
     def test_j_and_k_are_available_to_filter(self):
         screen = FakeScreen()
@@ -174,6 +184,17 @@ class ReviewFixTests(unittest.TestCase):
         self.assertIsNone(app.hunt)
         self.assertEqual(app.tune_error, "Unable to lock channel 124: Operation not permitted")
 
+    def test_hunt_without_known_frequency_returns_to_scan_with_error(self):
+        screen = FakeScreen()
+        screen.key = "\n"
+        app = self.make_app(screen)
+        app.aps["AA"] = AccessPoint("AA", "Office", -40, 124, None)
+        monitor = Mock()
+        app._keys(monitor)
+        self.assertIsNone(app.hunt)
+        self.assertEqual(app.tune_error, "Unable to lock channel: AA has no known frequency yet")
+        monitor.set_frequency.assert_not_called()
+
     def test_capture_failure_is_reported(self):
         capture = TsharkCapture("mon0")
         capture.process = Mock(poll=Mock(return_value=2))
@@ -188,6 +209,38 @@ class ReviewFixTests(unittest.TestCase):
         capture.stderr.write("tshark: mon0: Permission denied\n0 packets captured\n")
         with self.assertRaisesRegex(RuntimeError, "(?s)Permission denied.*0 packets captured"):
             capture.raise_if_failed()
+        capture.stderr.close()
+
+    @patch("fox80211.capture.subprocess.run")
+    def test_tshark_field_discovery_parses_field_abbreviations(self, run):
+        run.return_value = Mock(
+            returncode=0,
+            stdout="F\tSSID\twlan.ssid\tFT_STRING\twlan\nF\tRaw SSID\twlan.ssid_raw\tFT_BYTES\twlan\n",
+        )
+        self.assertEqual(_tshark_fields(), {"wlan.ssid", "wlan.ssid_raw"})
+
+    @patch("fox80211.capture.subprocess.Popen")
+    @patch("fox80211.capture._tshark_fields", return_value={"wlan.ssid"})
+    def test_capture_omits_raw_ssid_when_tshark_does_not_support_it(self, _fields, popen):
+        process = popen.return_value
+        process.stdout = iter(())
+        capture = TsharkCapture("mon0")
+        capture.start()
+        capture.reader.join(timeout=1)
+        command = popen.call_args.args[0]
+        self.assertNotIn("wlan.ssid_raw", command)
+        capture.stderr.close()
+
+    @patch("fox80211.capture.subprocess.Popen")
+    @patch("fox80211.capture._tshark_fields", return_value={"wlan.ssid_raw"})
+    def test_capture_uses_raw_ssid_when_tshark_supports_it(self, _fields, popen):
+        process = popen.return_value
+        process.stdout = iter(())
+        capture = TsharkCapture("mon0")
+        capture.start()
+        capture.reader.join(timeout=1)
+        command = popen.call_args.args[0]
+        self.assertIn("wlan.ssid_raw", command)
         capture.stderr.close()
 
     @patch("fox80211.system.run")
