@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import queue
+import re
 import subprocess
 import tempfile
 import threading
@@ -106,19 +107,28 @@ def _integer(value: str) -> int | None:
 
 
 def _ssid(value: str, raw_value: str = "") -> str:
-    """Return a printable SSID, preferring the authoritative raw bytes."""
-    raw_hex = raw_value.replace(":", "")
-    if not value and not raw_hex:
-        return "<hidden>"
+    """Decode the SSID octets emitted by TShark into safe display text.
 
-    if raw_hex:
-        raw = bytes.fromhex(raw_hex)
+    ``wlan.ssid`` is an FT_BYTES field and is therefore normally rendered as
+    hexadecimal, despite its name.  Some TShark versions also expose the same
+    bytes as ``wlan.ssid_raw`` while others do not.  Treating the former as
+    already-decoded text is what produced long numeric strings in the UI.
+    """
+    encoded = raw_value or value
+    raw = _ssid_bytes(encoded)
+    if raw is None:
+        # Be tolerant of versions/builds which render wlan.ssid as text.
+        decoded = value
+    else:
         if not raw or not any(raw):
             return "<hidden>"
         decoded = raw.decode("utf-8", errors="replace")
-    else:
-        # Without the raw field there is no reliable way to distinguish old
-        # TShark hex output from an SSID whose actual name contains only hex
-        # digits. Preserve the display field rather than changing valid names.
-        decoded = value
     return "".join(character if character.isprintable() else "�" for character in decoded) or "<hidden>"
+
+
+def _ssid_bytes(value: str) -> bytes | None:
+    """Return bytes for a TShark hexadecimal byte field, or ``None`` for text."""
+    compact = value.strip().removeprefix("0x").replace(":", "")
+    if not compact or len(compact) % 2 or not re.fullmatch(r"[0-9a-fA-F]+", compact):
+        return b"" if not compact else None
+    return bytes.fromhex(compact)

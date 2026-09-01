@@ -51,20 +51,25 @@ class ReviewFixTests(unittest.TestCase):
         self.assertEqual(_ssid("4176656e676120436f72706f", "4176656e676120436f72706f"), "Avenga Corpo")
         self.assertEqual(_ssid("D0A2D0B5D181D182", "d0:a2:d0:b5:d1:81:d1:82"), "Тест")
 
-    def test_hexadecimal_ssid_is_preserved_without_optional_raw_field(self):
-        self.assertEqual(_ssid("4142"), "4142")
-        self.assertEqual(_ssid("31323334"), "31323334")
-        self.assertEqual(_ssid("4578616d706c6553534944"), "4578616d706c6553534944")
+    def test_hexadecimal_ssid_is_decoded_without_optional_raw_field(self):
+        self.assertEqual(_ssid("4142"), "AB")
+        self.assertEqual(_ssid("31323334"), "1234")
+        self.assertEqual(_ssid("4578616d706c6553534944"), "ExampleSSID")
 
     def test_hidden_and_plain_text_ssids_are_preserved(self):
         self.assertEqual(_ssid(""), "<hidden>")
         self.assertEqual(_ssid("Office Wi-Fi", "4f66666963652057692d4669"), "Office Wi-Fi")
 
-    def test_plain_hexadecimal_looking_ssids_are_preserved(self):
+    def test_raw_bytes_preserve_plain_hexadecimal_looking_ssids(self):
         self.assertEqual(_ssid("Cafe", "43616665"), "Cafe")
         self.assertEqual(_ssid("1234", "31323334"), "1234")
         self.assertEqual(_ssid("deadbeef", "6465616462656566"), "deadbeef")
-        self.assertEqual(_ssid("1234"), "1234")
+        self.assertEqual(_ssid("31323334"), "1234")
+
+    def test_text_rendering_and_malformed_hex_are_tolerated(self):
+        self.assertEqual(_ssid("Office Wi-Fi"), "Office Wi-Fi")
+        self.assertEqual(_ssid("abc"), "abc")
+        self.assertEqual(_ssid("0x43616665"), "Cafe")
 
     def test_raw_ssid_is_authoritative_when_display_field_is_hex_or_wrong(self):
         self.assertEqual(_ssid("43616665", "3433363136363635"), "43616665")
