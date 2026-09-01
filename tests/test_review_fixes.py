@@ -75,6 +75,7 @@ class ReviewFixTests(unittest.TestCase):
         self.assertEqual(_ssid("Office Wi-Fi"), "Office Wi-Fi")
         self.assertEqual(_ssid("abc"), "abc")
         self.assertEqual(_ssid("0x43616665", value_is_bytes=True), "Cafe")
+        self.assertEqual(_ssid("0X43616665", value_is_bytes=True), "Cafe")
 
     def test_raw_ssid_is_authoritative_when_display_field_is_hex_or_wrong(self):
         self.assertEqual(_ssid("43616665", "3433363136363635"), "43616665")
@@ -103,7 +104,7 @@ class ReviewFixTests(unittest.TestCase):
         self.assertEqual(len(highlighted), 1)
         self.assertIn("00:00:00:00:00:08", highlighted[0])
 
-    def test_scan_uses_every_row_below_three_line_header(self):
+    def test_scan_reserves_last_row_for_controls(self):
         screen = FakeScreen(height=8)
         app = self.make_app(screen)
         for index in range(10):
@@ -111,7 +112,19 @@ class ReviewFixTests(unittest.TestCase):
             app.aps[bssid] = AccessPoint(bssid, str(index), -30 - index, 1, 2412)
         app._draw_scan()
         access_point_rows = [row for row, text, _ in screen.writes if row >= 3 and "00:00:00:00:00:" in text]
-        self.assertEqual(access_point_rows, list(range(3, screen.height)))
+        self.assertEqual(access_point_rows, list(range(3, screen.height - 1)))
+        self.assertTrue(any(row == screen.height - 1 and "[Space] pause" in text and "[Q] quit" in text for row, text, _ in screen.writes))
+
+    def test_space_pauses_scan_and_updates_controls(self):
+        screen = FakeScreen()
+        app = self.make_app(screen)
+        screen.key = " "
+        app._keys(Mock())
+        app._draw_scan()
+        rendered = " ".join(text for _, text, _ in screen.writes)
+        self.assertTrue(app.paused)
+        self.assertIn("PAUSED", rendered)
+        self.assertIn("[Space] resume", rendered)
 
     def test_j_and_k_are_available_to_filter(self):
         screen = FakeScreen()
@@ -233,11 +246,19 @@ class ReviewFixTests(unittest.TestCase):
 
     @patch("fox80211.capture.subprocess.run")
     def test_tshark_field_discovery_parses_field_abbreviations(self, run):
+        _tshark_fields.cache_clear()
         run.return_value = Mock(
             returncode=0,
             stdout="F\tSSID\twlan.ssid\tFT_STRING\twlan\nF\tRaw SSID\twlan.ssid_raw\tFT_BYTES\twlan\n",
         )
         self.assertEqual(_tshark_fields(), {"wlan.ssid": "FT_STRING", "wlan.ssid_raw": "FT_BYTES"})
+
+    @patch("fox80211.capture.subprocess.run")
+    def test_tshark_field_discovery_is_cached(self, run):
+        _tshark_fields.cache_clear()
+        run.return_value = Mock(returncode=0, stdout="F\tSSID\twlan.ssid\tFT_STRING\twlan\n")
+        self.assertEqual(_tshark_fields(), _tshark_fields())
+        run.assert_called_once()
 
     @patch("fox80211.capture.subprocess.Popen")
     @patch("fox80211.capture._tshark_fields", return_value={"wlan.ssid": "FT_STRING"})

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from functools import lru_cache
 import queue
 import re
 import subprocess
@@ -87,6 +88,7 @@ class TsharkCapture:
         raise RuntimeError(f"tshark capture stopped: {message}")
 
 
+@lru_cache(maxsize=1)
 def _tshark_fields() -> dict[str, str]:
     """Return advertised field names and types, or no fields on failure."""
     try:
@@ -138,7 +140,9 @@ def _ssid(value: str, raw_value: str = "", value_is_bytes: bool = False) -> str:
 
 def _ssid_bytes(value: str) -> bytes | None:
     """Return bytes for a TShark hexadecimal byte field, or ``None`` for text."""
-    compact = value.strip().removeprefix("0x").replace(":", "")
+    stripped = value.strip()
+    compact = stripped[2:] if stripped[:2].lower() == "0x" else stripped
+    compact = compact.replace(":", "")
     if not compact or len(compact) % 2 or not re.fullmatch(r"[0-9a-fA-F]+", compact):
         return b"" if not compact else None
     return bytes.fromhex(compact)
