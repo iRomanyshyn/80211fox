@@ -10,7 +10,8 @@ import threading
 class TsharkCapture:
     """Thin, UI-independent stream of parsed beacon/probe-response observations."""
 
-    FIELDS = ("wlan.bssid", "wlan.ssid", "wlan.ssid_raw", "radiotap.dbm_antsignal", "wlan_radio.channel", "wlan_radio.frequency")
+    FIELDS = ("wlan.bssid", "wlan.ssid", "radiotap.dbm_antsignal", "wlan_radio.channel", "wlan_radio.frequency")
+    OPTIONAL_FIELDS = ("wlan.ssid_raw",)
 
     def __init__(self, interface: str):
         self.interface = interface
@@ -19,10 +20,14 @@ class TsharkCapture:
         self.reader: threading.Thread | None = None
         self.stderr = tempfile.TemporaryFile(mode="w+t")
         self.stopping = False
+        self.fields = self.FIELDS
 
     def start(self) -> None:
+        supported = _tshark_fields()
+        optional = tuple(field for field in self.OPTIONAL_FIELDS if field in supported)
+        self.fields = self.FIELDS + optional
         args = ["tshark", "-l", "-n", "-i", self.interface, "-Y", "wlan.fc.type_subtype == 8 || wlan.fc.type_subtype == 5", "-T", "fields"]
-        for field in self.FIELDS:
+        for field in self.fields:
             args += ["-e", field]
         args += ["-E", "separator=\t", "-E", "quote=d"]
         self.process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=self.stderr, text=True)
@@ -32,12 +37,13 @@ class TsharkCapture:
     def _read(self) -> None:
         assert self.process and self.process.stdout
         for row in csv.reader(self.process.stdout, delimiter="\t"):
-            if len(row) != 6 or not row[0]:
+            if len(row) != len(self.fields) or not row[0]:
                 continue
             try:
                 # Multiple antenna values are comma-separated; strongest is useful for hunting.
-                signals = [int(x) for x in row[3].split(",") if x]
-                self.events.put((row[0].upper(), _ssid(row[1], row[2]), max(signals), _integer(row[4]), _integer(row[5])))
+                signals = [int(x) for x in row[2].split(",") if x]
+                raw_ssid = row[5] if "wlan.ssid_raw" in self.fields else ""
+                self.events.put((row[0].upper(), _ssid(row[1], raw_ssid), max(signals), _integer(row[3]), _integer(row[4])))
             except ValueError:
                 continue
 
@@ -68,6 +74,28 @@ class TsharkCapture:
         # reducing it to that unhelpful final line.
         message = detail[-8192:] if detail else f"exit status {status}"
         raise RuntimeError(f"tshark capture stopped: {message}")
+
+
+def _tshark_fields() -> set[str]:
+    """Return fields advertised by this TShark, or no optional fields on failure."""
+    try:
+        result = subprocess.run(
+            ["tshark", "-G", "fields"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    if result.returncode:
+        return set()
+    return {
+        columns[2]
+        for line in result.stdout.splitlines()
+        if len(columns := line.split("\t")) > 2 and columns[0] == "F"
+    }
 
 
 def _integer(value: str) -> int | None:

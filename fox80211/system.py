@@ -139,7 +139,6 @@ class MonitorInterface:
         self.adapter = adapter
         self.name = f"whmon{os.getpid() % 10000}"
         self.created = False
-        self.changed = False
         self.type_changed = False
         self.link_changed = False
         self.original_managed: bool | None = None
@@ -174,7 +173,6 @@ class MonitorInterface:
                     run("ip", "link", "set", self.name, "down")
                 self.type_changed = True
                 run("iw", "dev", self.name, "set", "type", "monitor")
-                self.changed = True
             run("ip", "link", "set", self.name, "up")
             return self
         except Exception:

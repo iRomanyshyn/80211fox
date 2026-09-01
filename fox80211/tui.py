@@ -152,10 +152,13 @@ class Application:
             visible = self._visible()
             if visible:
                 target = visible[min(self.selected, len(visible) - 1)]
-                # Publish HUNT first, then wait for an outstanding hopping tune
-                # before locking the target frequency.
-                self.hunt = target
-                if target.frequency:
+                if not target.frequency:
+                    self.tune_error = f"Unable to lock channel: {target.bssid} has no known frequency yet"
+                    self.hunt = None
+                else:
+                    # Publish HUNT first, then wait for an outstanding hopping
+                    # tune before locking the target frequency.
+                    self.hunt = target
                     with self.tune_lock:
                         try:
                             monitor.set_frequency(target.frequency)
@@ -196,7 +199,7 @@ class Application:
             self.screen.addnstr(1, 0, self.tune_error, self.screen.getmaxyx()[1] - 1, curses.A_BOLD)
         visible = self._visible()
         self.selected = min(self.selected, max(0, len(visible) - 1))
-        page_size = max(1, self.screen.getmaxyx()[0] - 4)
+        page_size = max(1, self.screen.getmaxyx()[0] - 3)
         offset = min(max(0, self.selected - page_size + 1), max(0, len(visible) - page_size))
         for row, ap in enumerate(visible[offset : offset + page_size]):
             index = offset + row
