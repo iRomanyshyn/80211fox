@@ -4,6 +4,8 @@ from collections import deque
 from dataclasses import dataclass, field
 import time
 
+RSSI_HISTORY_SECONDS = 10.0
+
 
 def normalize_mac(value: str) -> str:
     return "".join(c for c in value.casefold() if c in "0123456789abcdef")
@@ -45,6 +47,7 @@ class AccessPoint:
         self.frequency = frequency or self.frequency
         self.last_seen = time.monotonic()
         self.rssi_history.append((self.last_seen, rssi))
+        self._prune_rssi_history(self.last_seen - RSSI_HISTORY_SECONDS)
         self.samples += 1
         self.average = rssi if self.average is None else 0.25 * rssi + 0.75 * self.average
         self.minimum = rssi if self.minimum is None else min(self.minimum, rssi)
@@ -54,10 +57,13 @@ class AccessPoint:
         """Return the mean RSSI observed within the rolling time window."""
         now = time.monotonic() if now is None else now
         cutoff = now - seconds
-        while len(self.rssi_history) > 1 and self.rssi_history[0][0] < cutoff:
-            self.rssi_history.popleft()
+        self._prune_rssi_history(cutoff)
         samples = [rssi for timestamp, rssi in self.rssi_history if timestamp >= cutoff]
         return sum(samples) / len(samples) if samples else float(self.rssi)
+
+    def _prune_rssi_history(self, cutoff: float) -> None:
+        while self.rssi_history and self.rssi_history[0][0] < cutoff:
+            self.rssi_history.popleft()
 
     def matches(self, query: str) -> bool:
         query = query.strip().casefold()
