@@ -1,41 +1,76 @@
 from __future__ import annotations
 
 import csv
-from functools import lru_cache
 import queue
 import re
 import subprocess
 import tempfile
 import threading
+import time
+from functools import lru_cache
+
+DISCOVERY_FILTER = "wlan.fc.type_subtype == 8 || wlan.fc.type_subtype == 5"
+EVENT_QUEUE_SIZE = 1024
+TARGET_EVENT_INTERVAL = 0.05
+CaptureEvent = tuple[str, str, int, int | None, int | None]
 
 
 class TsharkCapture:
-    """Thin, UI-independent stream of parsed beacon/probe-response observations."""
+    """Thin, UI-independent stream of parsed Wi-Fi observations."""
 
-    FIELDS = ("wlan.bssid", "wlan.ssid", "radiotap.dbm_antsignal", "wlan_radio.channel", "wlan_radio.frequency")
+    FIELDS = (
+        "wlan.bssid",
+        "wlan.ssid",
+        "radiotap.dbm_antsignal",
+        "wlan_radio.channel",
+        "wlan_radio.frequency",
+    )
     OPTIONAL_FIELDS = ("wlan.ssid_raw",)
 
-    def __init__(self, interface: str):
+    def __init__(self, interface: str, target_bssid: str | None = None):
         self.interface = interface
-        self.events: queue.Queue[tuple[str, str, int, int | None, int | None]] = queue.Queue()
+        self.target_bssid = _validated_bssid(target_bssid) if target_bssid else None
+        self.events: queue.Queue[CaptureEvent] = queue.Queue(maxsize=EVENT_QUEUE_SIZE)
         self.process: subprocess.Popen[str] | None = None
         self.reader: threading.Thread | None = None
         self.stderr = tempfile.TemporaryFile(mode="w+t")
         self.stopping = False
         self.fields = self.FIELDS
         self.ssid_is_bytes = False
+        self.last_target_event = 0.0
 
     def start(self) -> None:
         supported = _tshark_fields()
         optional = tuple(field for field in self.OPTIONAL_FIELDS if field in supported)
         self.fields = self.FIELDS + optional
         self.ssid_is_bytes = supported.get("wlan.ssid") == "FT_BYTES"
-        args = ["tshark", "-l", "-n", "-i", self.interface, "-Y", "wlan.fc.type_subtype == 8 || wlan.fc.type_subtype == 5", "-T", "fields"]
+        display_filter = DISCOVERY_FILTER
+        if self.target_bssid:
+            # Discovery needs only management frames, but HUNT can refresh its
+            # RSSI from every frame transmitted by the selected AP. Filtering
+            # on wlan.ta avoids measuring uplink frames sent by nearby clients
+            # that merely belong to the same BSSID.
+            display_filter = f"({display_filter}) || wlan.ta == {self.target_bssid}"
+        args = [
+            "tshark",
+            "-l",
+            "-n",
+            "-i",
+            self.interface,
+            "-Y",
+            display_filter,
+            "-T",
+            "fields",
+        ]
         for field in self.fields:
             args += ["-e", field]
         args += ["-E", "separator=\t", "-E", "quote=d"]
-        self.process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=self.stderr, text=True)
-        self.reader = threading.Thread(target=self._read, name="80211fox-capture", daemon=True)
+        self.process = subprocess.Popen(
+            args, stdout=subprocess.PIPE, stderr=self.stderr, text=True
+        )
+        self.reader = threading.Thread(
+            target=self._read, name="80211fox-capture", daemon=True
+        )
         self.reader.start()
 
     def _read(self) -> None:
@@ -47,7 +82,7 @@ class TsharkCapture:
                 # Multiple antenna values are comma-separated; strongest is useful for hunting.
                 signals = [int(x) for x in row[2].split(",") if x]
                 raw_ssid = row[5] if "wlan.ssid_raw" in self.fields else ""
-                self.events.put(
+                self._emit(
                     (
                         row[0].upper(),
                         _ssid(row[1], raw_ssid, self.ssid_is_bytes),
@@ -58,6 +93,26 @@ class TsharkCapture:
                 )
             except ValueError:
                 continue
+
+    def _emit(self, event: CaptureEvent) -> None:
+        if self.target_bssid and event[0].casefold() == self.target_bssid:
+            now = time.monotonic()
+            if now - self.last_target_event < TARGET_EVENT_INTERVAL:
+                return
+            self.last_target_event = now
+        try:
+            self.events.put_nowait(event)
+        except queue.Full:
+            # Prefer recent signal data over an unbounded backlog. There is a
+            # single producer, while the UI is the only consumer.
+            try:
+                self.events.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.events.put_nowait(event)
+            except queue.Full:
+                pass
 
     def stop(self) -> None:
         self.stopping = True
@@ -118,6 +173,13 @@ def _integer(value: str) -> int | None:
         return None
 
 
+def _validated_bssid(value: str) -> str:
+    normalized = value.strip().casefold()
+    if not re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", normalized):
+        raise ValueError(f"invalid BSSID for TShark display filter: {value!r}")
+    return normalized
+
+
 def _ssid(value: str, raw_value: str = "", value_is_bytes: bool = False) -> str:
     """Decode the SSID octets emitted by TShark into safe display text.
 
@@ -135,7 +197,10 @@ def _ssid(value: str, raw_value: str = "", value_is_bytes: bool = False) -> str:
         if not raw or not any(raw):
             return "<hidden>"
         decoded = raw.decode("utf-8", errors="replace")
-    return "".join(character if character.isprintable() else "�" for character in decoded) or "<hidden>"
+    return (
+        "".join(character if character.isprintable() else "�" for character in decoded)
+        or "<hidden>"
+    )
 
 
 def _ssid_bytes(value: str) -> bytes | None:

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import re
 import subprocess
+from pathlib import Path
 
 from .model import Adapter
+
+_APP_MONITOR = re.compile(r"^whmon(\d+)$")
 
 
 def run(*args: str, check: bool = True) -> str:
@@ -13,7 +15,9 @@ def run(*args: str, check: bool = True) -> str:
     # translate stable tokens such as NetworkManager's `yes`/`no` values.
     environment = os.environ.copy()
     environment["LC_ALL"] = "C"
-    return subprocess.run(args, check=check, text=True, capture_output=True, env=environment).stdout
+    return subprocess.run(
+        args, check=check, text=True, capture_output=True, env=environment
+    ).stdout
 
 
 def discover_adapters() -> list[Adapter]:
@@ -29,7 +33,11 @@ def discover_adapters() -> list[Adapter]:
         if not match:
             continue
         name = match.group(1)
-        block = output[output.find(line):]
+        # Monitor VIFs created by this application are implementation details,
+        # not additional physical adapters a user should be asked to select.
+        if _APP_MONITOR.fullmatch(name):
+            continue
+        block = output[output.find(line) :]
         next_iface = block.find("\n\tInterface", 1)
         if next_iface >= 0:
             block = block[:next_iface]
@@ -40,8 +48,20 @@ def discover_adapters() -> list[Adapter]:
         vendor = _read(device_path / "vendor")
         device = _read(device_path / "device")
         model = _device_product(device_path)
-        description = model or ":".join(x.removeprefix("0x") for x in (vendor, device) if x) or "?"
-        adapters.append(Adapter(name, phy, driver, description, mode_match.group(1) if mode_match else "?"))
+        description = (
+            model
+            or ":".join(x.removeprefix("0x") for x in (vendor, device) if x)
+            or "?"
+        )
+        adapters.append(
+            Adapter(
+                name,
+                phy,
+                driver,
+                description,
+                mode_match.group(1) if mode_match else "?",
+            )
+        )
 
     monitor_phys = _monitor_phys()
     for adapter in adapters:
@@ -50,6 +70,33 @@ def discover_adapters() -> list[Adapter]:
         adapter.connection_known = associated is not None
         adapter.monitor = adapter.phy in monitor_phys
     return adapters
+
+
+def cleanup_orphan_monitors() -> list[str]:
+    """Remove app-created monitor VIFs whose owning PID no longer exists."""
+    output = run("iw", "dev")
+    interfaces: list[tuple[str, str]] = []
+    name: str | None = None
+    for line in output.splitlines():
+        match = re.match(r"\s*Interface\s+(\S+)", line)
+        if match:
+            name = match.group(1)
+            continue
+        mode = re.match(r"\s*type\s+(\S+)", line)
+        if name is not None and mode:
+            interfaces.append((name, mode.group(1)))
+            name = None
+
+    removed: list[str] = []
+    for interface, mode in interfaces:
+        match = _APP_MONITOR.fullmatch(interface)
+        if mode != "monitor" or match is None:
+            continue
+        if (Path("/proc") / match.group(1)).exists():
+            continue
+        run("iw", "dev", interface, "del", check=False)
+        removed.append(interface)
+    return removed
 
 
 def _read(path: Path) -> str:
@@ -137,7 +184,10 @@ class MonitorInterface:
 
     def __init__(self, adapter: Adapter):
         self.adapter = adapter
-        self.name = f"whmon{os.getpid() % 10000}"
+        # Linux PIDs fit comfortably below IFNAMSIZ with this prefix. Keeping
+        # the complete PID lets the next invocation distinguish a live owner
+        # from a VIF orphaned by an uncatchable process termination.
+        self.name = f"whmon{os.getpid()}"
         self.created = False
         self.type_changed = False
         self.link_changed = False
@@ -160,12 +210,25 @@ class MonitorInterface:
         try:
             self._isolate_original()
             try:
-                run("iw", "phy", self.adapter.phy, "interface", "add", self.name, "type", "monitor")
+                run(
+                    "iw",
+                    "phy",
+                    self.adapter.phy,
+                    "interface",
+                    "add",
+                    self.name,
+                    "type",
+                    "monitor",
+                )
                 self.created = True
             except subprocess.CalledProcessError:
                 self.name = self.adapter.interface
                 if self.adapter.connected or not self.adapter.connection_known:
-                    reason = "active connection" if self.adapter.connected else "unknown connection state"
+                    reason = (
+                        "active connection"
+                        if self.adapter.connected
+                        else "unknown connection state"
+                    )
                     raise RuntimeError(f"refusing in-place monitor mode: {reason}")
                 # Record each mutation before the next command can fail so
                 # __enter__ can reverse partially completed setup.
@@ -183,11 +246,23 @@ class MonitorInterface:
         run("iw", "dev", self.name, "set", "freq", str(frequency))
 
     def _nm_managed(self, interface: str) -> bool | None:
-        try:
-            value = run("nmcli", "-g", "GENERAL.MANAGED", "device", "show", interface).strip().casefold()
-        except (FileNotFoundError, subprocess.CalledProcessError):
-            return None
-        return {"yes": True, "no": False}.get(value)
+        # NetworkManager 1.56 renamed the terse-output field to
+        # GENERAL.NM-MANAGED. Keep the older spelling as a compatibility
+        # fallback so a failed status query cannot leave NetworkManager free
+        # to retune the selected PHY during HUNT.
+        for field in ("GENERAL.NM-MANAGED", "GENERAL.MANAGED"):
+            try:
+                value = (
+                    run("nmcli", "-g", field, "device", "show", interface)
+                    .strip()
+                    .casefold()
+                )
+            except FileNotFoundError:
+                return None
+            except subprocess.CalledProcessError:
+                continue
+            return {"yes": True, "no": False}.get(value)
+        return None
 
     def _set_nm(self, interface: str, managed: bool) -> None:
         run("nmcli", "device", "set", interface, "managed", "yes" if managed else "no")
@@ -198,7 +273,15 @@ class MonitorInterface:
         else:
             if self.type_changed:
                 run("ip", "link", "set", self.name, "down", check=False)
-                run("iw", "dev", self.name, "set", "type", self.adapter.mode, check=False)
+                run(
+                    "iw",
+                    "dev",
+                    self.name,
+                    "set",
+                    "type",
+                    self.adapter.mode,
+                    check=False,
+                )
         if self.link_changed and self.was_up:
             run("ip", "link", "set", self.adapter.interface, "up", check=False)
         if self.nm_changed and self.original_managed is not None:

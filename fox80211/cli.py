@@ -3,37 +3,56 @@ from __future__ import annotations
 import argparse
 import curses
 import os
-import signal
 import shutil
+import signal
 import sys
 
-from .system import discover_adapters
-from .tui import Application, configure_colors, select_adapter
 from .sound import DisabledSound, TerminalBell
+from .system import cleanup_orphan_monitors, discover_adapters
+from .tui import Application, configure_colors, select_adapter
+
+
+def _install_signal_handlers() -> None:
+    def terminate(_signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt
+
+    # Closing a terminal normally sends SIGHUP rather than SIGTERM. Route both
+    # through the regular exception unwinding so monitor/network state is
+    # restored by context managers.
+    for signum in (signal.SIGHUP, signal.SIGTERM):
+        signal.signal(signum, terminate)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Passively locate Wi-Fi access points")
     parser.add_argument("--interface", help="preselect a wireless interface")
-    parser.add_argument("--sound", choices=("terminal", "off"), default="terminal", help="beep backend (default: terminal)")
+    parser.add_argument(
+        "--sound",
+        choices=("terminal", "off"),
+        default="terminal",
+        help="beep backend (default: terminal)",
+    )
     args = parser.parse_args()
     missing = [tool for tool in ("iw", "ip", "tshark") if not shutil.which(tool)]
     if missing:
         parser.error("missing required command(s): " + ", ".join(missing))
     if os.geteuid() != 0:
-        parser.error("MVP requires root (run with sudo); no privilege escalation is attempted")
+        parser.error(
+            "MVP requires root (run with sudo); no privilege escalation is attempted"
+        )
+    _install_signal_handlers()
+    cleanup_orphan_monitors()
     adapters = discover_adapters()
     if not adapters:
         parser.error("no nl80211 Wi-Fi interfaces found")
 
-    def terminate(_signum: int, _frame: object) -> None:
-        raise KeyboardInterrupt
-
-    signal.signal(signal.SIGTERM, terminate)
-
     def run(screen: curses.window) -> None:
         configure_colors()
-        adapter = next((a for a in adapters if a.interface == args.interface), None) if args.interface else select_adapter(screen, adapters)
+        adapter = (
+            next((a for a in adapters if a.interface == args.interface), None)
+            if args.interface
+            else select_adapter(screen, adapters)
+        )
         if args.interface and adapter is None:
             raise RuntimeError(f"interface {args.interface!r} not found")
         assert adapter

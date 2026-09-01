@@ -1,4 +1,5 @@
 # 80211fox
+
 **find access points by signal**
 
 A small Linux TUI for physically locating a Wi-Fi access point by SSID/BSSID,
@@ -8,15 +9,18 @@ RSSI, channel locking, and proximity beeps. It leaves unrelated Wi-Fi PHYs alone
 
 The MVP uses only Python's standard library plus common distribution packages:
 
-* **`iw`/nl80211** creates the monitor interface and tunes it. Frequencies and
+- **`iw`/nl80211** creates the monitor interface and tunes it. Frequencies and
   primary channel numbers come from `iw phy … info`, so the kernel's current
   regulatory view is authoritative; there is no hard-coded channel list.
-* **TShark** captures passively and emits selected, tab-separated Wireshark
-  fields. This avoids a home-grown radiotap/802.11 parser, Python packet
-  dependencies, and Kali-specific tools. Capture is separate from the TUI.
-* **sysfs** supplies driver and USB/PCI identity, while optional `nmcli` reports
+- **TShark** captures passively and emits selected, tab-separated Wireshark
+  fields. SCAN uses beacon/probe-response frames; after a BSSID is selected,
+  HUNT also uses data frames transmitted by that AP for denser RSSI updates,
+  while excluding uplink frames from clients. This avoids a home-grown
+  radiotap/802.11 parser, Python packet dependencies, and Kali-specific tools.
+  Capture is separate from the TUI.
+- **sysfs** supplies driver and USB/PCI identity, while optional `nmcli` reports
   active connections and manages only the selected fallback interface.
-* **stdlib `curses`** keeps installation small. Sound uses a small backend
+- **stdlib `curses`** keeps installation small. Sound uses a small backend
   boundary: the zero-dependency terminal bell can be disabled and real audio
   can be added later without coupling it to the TUI. The privilege model is
   deliberately simple: run the complete program as root. It never invokes
@@ -29,17 +33,17 @@ in `system.py`.
 
 ### Important radio details
 
-* Disabled frequencies are excluded. `no IR`/DFS frequencies are retained:
+- Disabled frequencies are excluded. `no IR`/DFS frequencies are retained:
   monitor capture is passive, and every tune is still allowed or rejected by
   nl80211/driver/regdomain. Thus channels 120/124/128 are attempted when the PHY
   advertises them. Some hardware/firmware/regdomains still refuse a DFS tune.
-* Channel width is intentionally not guessed in this MVP. The table reports the
+- Channel width is intentionally not guessed in this MVP. The table reports the
   reliable primary channel and frequency. HT/VHT/HE operation elements can be
   added later to produce `124+` only when unambiguous.
-* Radiotap may contain one signal value per antenna. TShark can emit these as a
+- Radiotap may contain one signal value per antenna. TShark can emit these as a
   list; 80211fox uses the strongest value, then applies an EWMA for the bar and
   beep cadence. The raw current value remains visible.
-* The selected PHY is dedicated to hunting. Its original interface is made
+- The selected PHY is dedicated to hunting. Its original interface is made
   unmanaged and down before a separate monitor VIF is attempted, preventing
   NetworkManager background scans from fighting channel hopping on the same
   radio. Interface-combination limits or a
@@ -47,7 +51,7 @@ in `system.py`.
   place; it refuses that fallback when nl80211 reports an active connection or
   cannot determine association state. Its original link and NetworkManager
   states are restored during cleanup in either path.
-* A monitor VIF on the same PHY does **not** create another radio: concurrent
+- A monitor VIF on the same PHY does **not** create another radio: concurrent
   managed and monitor VIFs generally share a channel. Use the separate USB PHY
   described in the intended workflow for hopping without disrupting the main
   connection.
@@ -82,18 +86,23 @@ MAC addresses are ignored. `Space` and `Q` are ordinary filter characters while
 the field is active. Backspace edits, Enter commits the filter, Escape cancels
 the edit, arrows select, and Enter starts HUNT outside the filter field. Space
 freezes or resumes the scan, including its access-point values and ordering. In
-HUNT, `B` toggles cadence beeps, `R` resets statistics,
-Escape returns to scanning, and `Q` quits. After two seconds without the target,
-beeps stop and HUNT displays `SIGNAL LOST` instead of stale strength. SCAN dims
-observations after ten seconds, sorts them behind live APs, and removes them
-after thirty seconds. Its status reports usable/rejected tunes; a failed HUNT
-lock is reported in SCAN rather than terminating the program.
+HUNT, `B` toggles cadence beeps, `R` resets statistics, Escape returns to
+scanning, and `Q` quits. Without a target frame, beeps stop and HUNT displays
+`SIGNAL LOST` after two seconds on 2.4 GHz or five seconds on 5 GHz. SCAN sorts
+all observations by smoothed RSSI, marks an AP with `?` after one minute without
+a frame, and removes it after thirty minutes. Its text follows the smoothed RSSI
+through a signal color gradient (with a simpler fallback on limited terminals),
+while the LAST column makes observation age explicit. Its status reports
+usable/rejected tunes; a failed HUNT lock is reported in SCAN rather than
+terminating the program. HUNT stretches its signal bar to the available
+terminal width.
 
-Cleanup is context-managed. Normal exit, Ctrl-C, the installed SIGTERM handler,
-and Python exceptions stop
+Cleanup is context-managed. Normal exit, Ctrl-C, closing the terminal (SIGHUP),
+the installed SIGTERM handler, and Python exceptions stop
 capture and remove the created VIF or restore the selected interface's type,
-link state, and NetworkManager management. `SIGKILL` and machine failure cannot
-be cleaned up by any process.
+link state, and NetworkManager management. On startup, app-created `whmon<PID>`
+interfaces whose owner no longer exists are removed and never appear in the
+adapter picker. `SIGKILL` and machine failure cannot run in-process cleanup.
 
 ## Development
 

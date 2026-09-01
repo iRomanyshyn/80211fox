@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import time
 from collections import deque
 from dataclasses import dataclass, field
-import time
 
 RSSI_HISTORY_SECONDS = 10.0
 
@@ -40,6 +40,12 @@ class AccessPoint:
     def __post_init__(self) -> None:
         if not self.rssi_history:
             self.rssi_history.append((self.last_seen, self.rssi))
+        if self.average is None:
+            self.average = float(self.rssi)
+        if self.minimum is None:
+            self.minimum = self.rssi
+        if self.maximum is None:
+            self.maximum = self.rssi
 
     def update(self, rssi: int, channel: int | None, frequency: int | None) -> None:
         self.rssi = rssi
@@ -49,7 +55,9 @@ class AccessPoint:
         self.rssi_history.append((self.last_seen, rssi))
         self._prune_rssi_history(self.last_seen - RSSI_HISTORY_SECONDS)
         self.samples += 1
-        self.average = rssi if self.average is None else 0.25 * rssi + 0.75 * self.average
+        self.average = (
+            rssi if self.average is None else 0.25 * rssi + 0.75 * self.average
+        )
         self.minimum = rssi if self.minimum is None else min(self.minimum, rssi)
         self.maximum = rssi if self.maximum is None else max(self.maximum, rssi)
 
@@ -71,4 +79,6 @@ class AccessPoint:
             return True
         mac_query = normalize_mac(query)
         mac_like = bool(mac_query) and all(c in "0123456789abcdef:-." for c in query)
-        return query in self.ssid.casefold() or (mac_like and mac_query in normalize_mac(self.bssid))
+        return query in self.ssid.casefold() or (
+            mac_like and mac_query in normalize_mac(self.bssid)
+        )

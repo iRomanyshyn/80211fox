@@ -8,18 +8,41 @@ import time
 from collections.abc import Callable
 
 from .capture import TsharkCapture
-from .model import RSSI_HISTORY_SECONDS, AccessPoint, Adapter
-from .system import MonitorInterface, available_frequencies
+from .model import AccessPoint, Adapter
 from .sound import SoundBackend, TerminalBell
+from .system import MonitorInterface, available_frequencies
 
-STALE_AFTER = 10.0
-EXPIRE_AFTER = 30.0
+UNCERTAIN_AFTER = 60.0
+EXPIRE_AFTER = 30.0 * 60.0
 LOST_AFTER = 2.0
+FIVE_GHZ_LOST_AFTER = 5.0
 HOP_DWELL = 0.35
 HOP_TUNE_BUDGET = 0.1
 LOCK_RETRY_DELAY = 0.1
 LOCK_ATTEMPTS = 20
-SCAN_RSSI_WINDOW = RSSI_HISTORY_SECONDS
+EVENTS_PER_TICK = 64
+KEYS_PER_TICK = 8
+SCAN_GRADIENT_COLORS = (
+    52,
+    88,
+    124,
+    160,
+    166,
+    172,
+    178,
+    184,
+    190,
+    154,
+    118,
+    82,
+    46,
+    47,
+    48,
+    49,
+)
+SCAN_GRADIENT_PAIR_START = 16
+scan_gradient_pairs: tuple[int, ...] = ()
+color_pairs_configured = False
 
 
 def select_adapter(screen: curses.window, adapters: list[Adapter]) -> Adapter:
@@ -27,10 +50,16 @@ def select_adapter(screen: curses.window, adapters: list[Adapter]) -> Adapter:
     while True:
         screen.erase()
         screen.addstr(0, 0, "Select Wi-Fi adapter (↑/↓, Enter, Q)", curses.A_BOLD)
-        screen.addstr(2, 0, "IFACE        PHY    DRIVER       DEVICE              MODE       ACTIVE MONITOR")
+        screen.addstr(
+            2,
+            0,
+            "IFACE        PHY    DRIVER       DEVICE              MODE       ACTIVE MONITOR",
+        )
         for i, item in enumerate(adapters):
             attr = curses.A_REVERSE if i == selected else 0
-            active = "yes" if item.connected else ("no" if item.connection_known else "?")
+            active = (
+                "yes" if item.connected else ("no" if item.connection_known else "?")
+            )
             line = f"{item.interface:12.12} {item.phy:6} {item.driver:12.12} {item.device:19.19} {item.mode:10.10} {active:6} {'yes' if item.monitor else 'no'}"
             screen.addnstr(3 + i, 0, line, screen.getmaxyx()[1] - 1, attr)
         key = screen.get_wch()
@@ -42,7 +71,12 @@ def select_adapter(screen: curses.window, adapters: list[Adapter]) -> Adapter:
             selected = min(len(adapters) - 1, selected + 1)
         elif key in ("\n", "\r", 10, 13):
             if adapters[selected].connected:
-                screen.addstr(1, 0, "WARNING: this radio and its active connection will be taken offline. Enter to continue.", curses.A_BOLD)
+                screen.addstr(
+                    1,
+                    0,
+                    "WARNING: this radio and its active connection will be taken offline. Enter to continue.",
+                    curses.A_BOLD,
+                )
                 screen.refresh()
                 if screen.get_wch() not in ("\n", "\r", 10, 13):
                     continue
@@ -50,7 +84,9 @@ def select_adapter(screen: curses.window, adapters: list[Adapter]) -> Adapter:
 
 
 class Application:
-    def __init__(self, screen: curses.window, adapter: Adapter, sound: SoundBackend | None = None):
+    def __init__(
+        self, screen: curses.window, adapter: Adapter, sound: SoundBackend | None = None
+    ):
         self.screen = screen
         self.adapter = adapter
         self.aps: dict[str, AccessPoint] = {}
@@ -86,14 +122,28 @@ class Application:
         with MonitorInterface(self.adapter) as monitor:
             capture = TsharkCapture(monitor.name)
             capture.start()
-            hopper = threading.Thread(target=self._hop, args=(monitor, frequencies), name="80211fox-hopper", daemon=True)
+            hopper = threading.Thread(
+                target=self._hop,
+                args=(monitor, frequencies),
+                name="80211fox-hopper",
+                daemon=True,
+            )
             hopper.start()
             try:
                 self.screen.nodelay(True)
                 while self.running:
                     capture.raise_if_failed()
+                    self._input(monitor)
+                    if not self.running:
+                        break
                     self._events(capture, apply=not self.paused)
-                    self._keys(monitor)
+                    desired_target = self.hunt.bssid if self.hunt else None
+                    if capture.target_bssid != (
+                        desired_target.casefold() if desired_target else None
+                    ):
+                        capture = self._replace_capture(
+                            capture, monitor.name, desired_target
+                        )
                     self._draw()
                     time.sleep(0.05)
             finally:
@@ -102,7 +152,23 @@ class Application:
                 hopper.join(timeout=2)
                 capture.stop()
 
-    def _hop(self, monitor: MonitorInterface, frequencies: list[tuple[int, int]]) -> None:
+    @staticmethod
+    def _replace_capture(
+        current: TsharkCapture, interface: str, target_bssid: str | None
+    ) -> TsharkCapture:
+        """Switch capture filters with overlap so entering HUNT loses no frames."""
+        replacement = TsharkCapture(interface, target_bssid)
+        try:
+            replacement.start()
+        except Exception:
+            replacement.stop()
+            raise
+        current.stop()
+        return replacement
+
+    def _hop(
+        self, monitor: MonitorInterface, frequencies: list[tuple[int, int]]
+    ) -> None:
         while not self.stop_event.is_set():
             if self.paused:
                 self.stop_event.wait(0.1)
@@ -134,11 +200,14 @@ class Application:
                         # radio. Capture events may update the target while an
                         # external tuning command is in progress.
                         requested_frequency = target.frequency
-                        self.locking_hunt = self.current_frequency != requested_frequency
+                        self.locking_hunt = (
+                            self.current_frequency != requested_frequency
+                        )
                         if self.locking_hunt and not self._lock_frequency(
                             monitor,
                             requested_frequency,
-                            cancelled=lambda: self.stop_event.is_set() or self.hunt is not target,
+                            cancelled=lambda target=target: self.stop_event.is_set()
+                            or self.hunt is not target,
                         ):
                             continue
                         if self.hunt is target:
@@ -156,7 +225,7 @@ class Application:
                 self.stop_event.wait(0.1)
 
     def _events(self, capture: TsharkCapture, apply: bool = True) -> None:
-        while True:
+        for _ in range(EVENTS_PER_TICK):
             try:
                 bssid, ssid, rssi, channel, frequency = capture.events.get_nowait()
             except queue.Empty:
@@ -172,16 +241,34 @@ class Application:
                     ap.ssid = ssid
                 ap.update(rssi, channel, frequency)
             else:
-                self.aps[bssid] = AccessPoint(bssid, ssid, rssi, channel, frequency, average=float(rssi), minimum=rssi, maximum=rssi)
+                self.aps[bssid] = AccessPoint(
+                    bssid,
+                    ssid,
+                    rssi,
+                    channel,
+                    frequency,
+                    average=float(rssi),
+                    minimum=rssi,
+                    maximum=rssi,
+                )
         if apply:
             now = time.monotonic()
-            self.aps = {bssid: ap for bssid, ap in self.aps.items() if ap is self.hunt or now - ap.last_seen <= self.expire_after}
+            self.aps = {
+                bssid: ap
+                for bssid, ap in self.aps.items()
+                if ap is self.hunt or now - ap.last_seen <= self.expire_after
+            }
 
-    def _keys(self, monitor: MonitorInterface) -> None:
+    def _input(self, monitor: MonitorInterface) -> None:
+        for _ in range(KEYS_PER_TICK):
+            if not self._keys(monitor) or not self.running:
+                break
+
+    def _keys(self, monitor: MonitorInterface) -> bool:
         try:
             key = self.screen.get_wch()
         except curses.error:
-            return
+            return False
         if self.filter_editing:
             if key in ("\n", "\r", 10, 13):
                 self.filter_editing = False
@@ -195,8 +282,8 @@ class Application:
             elif isinstance(key, str) and key.isprintable():
                 self.filter += key
                 self.selected = 0
-            return
-        if key in ("q", "Q"):
+            return True
+        if key in ("q", "Q", "\x03", 3):
             self.running = False
         elif self.hunt:
             if key in (27, "\x1b"):
@@ -206,7 +293,12 @@ class Application:
                 self.beep = not self.beep
             elif key in ("r", "R"):
                 ap = self.hunt
-                ap.samples, ap.minimum, ap.maximum, ap.average = 1, ap.rssi, ap.rssi, float(ap.rssi)
+                ap.samples, ap.minimum, ap.maximum, ap.average = (
+                    1,
+                    ap.rssi,
+                    ap.rssi,
+                    float(ap.rssi),
+                )
         elif key == " ":
             self.paused = not self.paused
             self.paused_at = time.monotonic() if self.paused else None
@@ -238,9 +330,13 @@ class Application:
                     # tune_lock and verifies which frequency the radio is
                     # actually using.
                     self.locking_hunt = True
+        return True
 
     def _lock_frequency(
-        self, monitor: MonitorInterface, frequency: int, cancelled: Callable[[], bool] | None = None
+        self,
+        monitor: MonitorInterface,
+        frequency: int,
+        cancelled: Callable[[], bool] | None = None,
     ) -> bool:
         """Tune for hunt mode, retrying the driver's transient busy response."""
         for attempt in range(LOCK_ATTEMPTS):
@@ -256,17 +352,18 @@ class Application:
         return False
 
     def _visible(self) -> list[AccessPoint]:
-        now = self.paused_at if self.paused_at is not None else time.monotonic()
         return sorted(
             (ap for ap in self.aps.values() if ap.matches(self.filter)),
-            key=lambda ap: (now - ap.last_seen >= STALE_AFTER, -ap.recent_rssi(SCAN_RSSI_WINDOW, now)),
+            key=lambda ap: (-smoothed_rssi(ap), ap.bssid),
         )
 
     def _draw(self) -> None:
         self.screen.erase()
         height, width = self.screen.getmaxyx()
         if height < 4 or width < 20:
-            self.screen.addnstr(0, 0, "Terminal too small; resize", max(1, width - 1), curses.A_BOLD)
+            self.screen.addnstr(
+                0, 0, "Terminal too small; resize", max(1, width - 1), curses.A_BOLD
+            )
             self.screen.refresh()
             return
         if self.hunt:
@@ -280,29 +377,58 @@ class Application:
         prefix = f"{state}  {self.adapter.interface}/{self.adapter.phy}   filter: "
         self.screen.addstr(0, 0, prefix, curses.A_BOLD)
         field = f" {self.filter}{'_' if self.filter_editing else ''} "
-        field_attr = curses.A_REVERSE | curses.A_BOLD if self.filter_editing else curses.A_BOLD
-        self.screen.addnstr(0, len(prefix), field, max(0, self.screen.getmaxyx()[1] - len(prefix) - 1), field_attr)
+        field_attr = (
+            curses.A_REVERSE | curses.A_BOLD if self.filter_editing else curses.A_BOLD
+        )
+        self.screen.addnstr(
+            0,
+            len(prefix),
+            field,
+            max(0, self.screen.getmaxyx()[1] - len(prefix) - 1),
+            field_attr,
+        )
         total = len(self.channel_by_frequency)
         current = self.channel_by_frequency.get(self.current_frequency or 0, "?")
-        self.screen.addstr(1, 0, f"Channels: {total} available / {len(self.usable_frequencies)} usable / {len(self.rejected_frequencies)} rejected   Current: {current} ({self.current_frequency or '?'} MHz)")
-        self.screen.addstr(2, 0, "RSSI   CH    FREQ   BSSID              SSID                       LAST")
+        self.screen.addstr(
+            1,
+            0,
+            f"Channels: {total} available / {len(self.usable_frequencies)} usable / {len(self.rejected_frequencies)} rejected   Current: {current} ({self.current_frequency or '?'} MHz)",
+        )
+        self.screen.addstr(
+            2,
+            0,
+            "RSSI   CH    FREQ   BSSID              SSID                        LAST",
+        )
         if self.tune_error:
-            self.screen.addnstr(1, 0, self.tune_error, self.screen.getmaxyx()[1] - 1, curses.A_BOLD)
+            self.screen.addnstr(
+                1, 0, self.tune_error, self.screen.getmaxyx()[1] - 1, curses.A_BOLD
+            )
         visible = self._visible()
         self.selected = min(self.selected, max(0, len(visible) - 1))
         height, width = self.screen.getmaxyx()
         page_size = max(0, height - 4)
-        offset = min(max(0, self.selected - page_size + 1), max(0, len(visible) - page_size))
+        offset = min(
+            max(0, self.selected - page_size + 1), max(0, len(visible) - page_size)
+        )
         for row, ap in enumerate(visible[offset : offset + page_size]):
             index = offset + row
             now = self.paused_at if self.paused_at is not None else time.monotonic()
             age = now - ap.last_seen
-            rssi = round(ap.recent_rssi(SCAN_RSSI_WINDOW, now))
-            line = f"{rssi:4}  {str(ap.channel or '?'):>4}  {str(ap.frequency or '?'):>5}  {ap.bssid:17}  {ap.ssid:25.25}  {age:5.1f}s"
-            attr = curses.A_REVERSE if index == self.selected else (curses.A_DIM if age >= STALE_AFTER else 0)
+            rssi = round(smoothed_rssi(ap))
+            uncertain = "?" if age >= UNCERTAIN_AFTER else " "
+            line = f"{rssi:4}  {str(ap.channel or '?'):>4}  {str(ap.frequency or '?'):>5}  {ap.bssid:17}  {ap.ssid:25.25}  {uncertain}{format_age(age)}"
+            attr = scan_signal_attr(rssi)
+            if index == self.selected:
+                attr |= curses.A_REVERSE
             self.screen.addnstr(3 + row, 0, line, width - 1, attr)
         action = "resume" if self.paused else "pause"
-        self.screen.addnstr(height - 1, 0, f"[F] filter   [Space] {action}   [Enter] hunt selected network   [Q] quit", width - 1, curses.A_BOLD)
+        self.screen.addnstr(
+            height - 1,
+            0,
+            f"[F] filter   [Space] {action}   [Enter] hunt   [Q] quit   ? unseen 1m+",
+            width - 1,
+            curses.A_BOLD,
+        )
 
     def _draw_hunt(self, ap: AccessPoint) -> None:
         height, terminal_width = self.screen.getmaxyx()
@@ -312,31 +438,53 @@ class Application:
             return
         if self.locking_hunt:
             message = f"LOCKING CHANNEL {ap.channel or '?'} ({ap.frequency or '?'} MHz)"
-            self.screen.addstr(6, max(0, (terminal_width - len(message)) // 2), message, curses.A_BOLD)
+            self.screen.addstr(
+                6, max(0, (terminal_width - len(message)) // 2), message, curses.A_BOLD
+            )
             self._draw_hunt_controls(terminal_width)
             return
         smooth = ap.average if ap.average is not None else ap.rssi
         age = time.monotonic() - ap.last_seen
-        if age > LOST_AFTER:
-            width = max(10, min(50, terminal_width - 4))
-            self.screen.addstr(4, max(0, (terminal_width - 11) // 2), "SIGNAL LOST", curses.A_BOLD)
-            self.screen.addstr(6, max(0, (terminal_width - 6) // 2), "-- dBm", curses.A_BOLD)
+        if age > hunt_lost_after(ap.frequency):
+            width = max(10, terminal_width - 4)
+            self.screen.addstr(
+                4, max(0, (terminal_width - 11) // 2), "SIGNAL LOST", curses.A_BOLD
+            )
+            self.screen.addstr(
+                6, max(0, (terminal_width - 6) // 2), "-- dBm", curses.A_BOLD
+            )
             self.screen.addstr(8, 2, "░" * width)
             self.screen.addstr(12, 2, f"last {age:5.2f}s")
             self._draw_hunt_controls(terminal_width)
             return
         label, color = proximity(smooth)
-        width = max(10, min(50, terminal_width - 4))
+        width = max(10, terminal_width - 4)
         filled = round(width * max(0, min(1, (smooth + 90) / 65)))
-        lines = [ap.ssid, ap.bssid, f"CH {ap.channel or '?'}  {ap.frequency or '?'} MHz", "", f"{ap.rssi} dBm", ""]
+        lines = [
+            ap.ssid,
+            ap.bssid,
+            f"CH {ap.channel or '?'}  {ap.frequency or '?'} MHz",
+            "",
+            f"{ap.rssi} dBm",
+            "",
+        ]
         for row, text in enumerate(lines, 1):
-            self.screen.addstr(row, max(0, (self.screen.getmaxyx()[1] - len(text)) // 2), text, curses.A_BOLD)
+            self.screen.addstr(
+                row,
+                max(0, (self.screen.getmaxyx()[1] - len(text)) // 2),
+                text,
+                curses.A_BOLD,
+            )
         self.screen.addstr(7, 2, "█" * filled, curses.color_pair(color) | curses.A_BOLD)
         self.screen.addstr(7, 2 + filled, "░" * (width - filled))
         self.screen.addstr(9, 2, label, curses.color_pair(color) | curses.A_BOLD)
         minimum = ap.rssi if ap.minimum is None else ap.minimum
         maximum = ap.rssi if ap.maximum is None else ap.maximum
-        self.screen.addstr(11, 2, f"current {ap.rssi:4}   avg {smooth:5.1f}   min {minimum:4}   max {maximum:4}")
+        self.screen.addstr(
+            11,
+            2,
+            f"current {ap.rssi:4}   avg {smooth:5.1f}   min {minimum:4}   max {maximum:4}",
+        )
         self.screen.addstr(12, 2, f"last {age:5.2f}s   samples {ap.samples}")
         self._draw_hunt_controls(terminal_width)
         if self.beep and time.monotonic() - self.last_beep >= beep_interval(smooth):
@@ -351,7 +499,11 @@ class Application:
 def command_error(error: Exception) -> str:
     if isinstance(error, subprocess.CalledProcessError):
         stderr = (error.stderr or "").strip()
-        return stderr.rsplit("\n", 1)[-1] if stderr else f"command exited {error.returncode}"
+        return (
+            stderr.rsplit("\n", 1)[-1]
+            if stderr
+            else f"command exited {error.returncode}"
+        )
     return str(error)
 
 
@@ -366,6 +518,48 @@ def scan_expiry(frequency_count: int) -> float:
     # Reserve a per-channel tuning/scheduling budget as well as one complete
     # extra hop so observations remain visible until their channel is revisited.
     return max(EXPIRE_AFTER, (HOP_DWELL + HOP_TUNE_BUDGET) * (frequency_count + 1))
+
+
+def smoothed_rssi(ap: AccessPoint) -> float:
+    return ap.average if ap.average is not None else float(ap.rssi)
+
+
+def signal_level(rssi: float, levels: int) -> int:
+    strength = max(0.0, min(1.0, (rssi + 90.0) / 65.0))
+    return round((levels - 1) * strength)
+
+
+def scan_signal_attr(rssi: float) -> int:
+    if scan_gradient_pairs:
+        return curses.color_pair(
+            scan_gradient_pairs[signal_level(rssi, len(scan_gradient_pairs))]
+        )
+    attr = 0
+    if color_pairs_configured:
+        _label, color = proximity(rssi)
+        attr = curses.color_pair(color)
+    if rssi <= -80:
+        attr |= curses.A_DIM
+    elif rssi >= -45:
+        attr |= curses.A_BOLD
+    return attr
+
+
+def hunt_lost_after(frequency: int | None) -> float:
+    return (
+        FIVE_GHZ_LOST_AFTER
+        if frequency is not None and frequency >= 5000
+        else LOST_AFTER
+    )
+
+
+def format_age(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:5.1f}s"
+    total = int(seconds)
+    if total < 3600:
+        return f"{total // 60:3d}m{total % 60:02d}"
+    return f"{total // 3600:3d}h{total % 3600 // 60:02d}"
 
 
 def proximity(rssi: float) -> tuple[str, int]:
@@ -385,7 +579,28 @@ def beep_interval(rssi: float) -> float:
 
 
 def configure_colors() -> None:
+    global color_pairs_configured, scan_gradient_pairs
     curses.start_color()
     curses.use_default_colors()
-    for pair, color in enumerate((curses.COLOR_RED, curses.COLOR_YELLOW, curses.COLOR_GREEN, curses.COLOR_CYAN, curses.COLOR_MAGENTA), 1):
+    for pair, color in enumerate(
+        (
+            curses.COLOR_RED,
+            curses.COLOR_YELLOW,
+            curses.COLOR_GREEN,
+            curses.COLOR_CYAN,
+            curses.COLOR_MAGENTA,
+        ),
+        1,
+    ):
         curses.init_pair(pair, color, -1)
+    color_pairs_configured = True
+    scan_gradient_pairs = ()
+    if curses.COLORS >= 256 and curses.COLOR_PAIRS >= SCAN_GRADIENT_PAIR_START + len(
+        SCAN_GRADIENT_COLORS
+    ):
+        pairs = []
+        for offset, color in enumerate(SCAN_GRADIENT_COLORS):
+            pair = SCAN_GRADIENT_PAIR_START + offset
+            curses.init_pair(pair, color, -1)
+            pairs.append(pair)
+        scan_gradient_pairs = tuple(pairs)

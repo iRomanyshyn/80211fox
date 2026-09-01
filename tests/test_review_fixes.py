@@ -1,15 +1,37 @@
-from collections import deque
 import curses
 import queue
+import signal
 import subprocess
 import time
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
-from fox80211.capture import TsharkCapture, _ssid, _tshark_fields
+from fox80211.capture import (
+    EVENT_QUEUE_SIZE,
+    TsharkCapture,
+    _ssid,
+    _tshark_fields,
+)
+from fox80211.cli import _install_signal_handlers
 from fox80211.model import AccessPoint, Adapter
-from fox80211.system import MonitorInterface, _interface_associated, available_frequencies
-from fox80211.tui import HOP_DWELL, HOP_TUNE_BUDGET, LOCK_ATTEMPTS, Application, scan_expiry
+from fox80211.system import (
+    MonitorInterface,
+    _interface_associated,
+    available_frequencies,
+    cleanup_orphan_monitors,
+    discover_adapters,
+)
+from fox80211.tui import (
+    EVENTS_PER_TICK,
+    EXPIRE_AFTER,
+    HOP_DWELL,
+    HOP_TUNE_BUDGET,
+    KEYS_PER_TICK,
+    LOCK_ATTEMPTS,
+    Application,
+    scan_expiry,
+    signal_level,
+)
 
 
 class FakeScreen:
@@ -49,13 +71,18 @@ class ReviewFixTests(unittest.TestCase):
         return Application(screen or FakeScreen(), Adapter("wlan1", "phy1"))
 
     def test_tshark_hex_ssid_is_decoded_for_display(self):
-        self.assertEqual(_ssid("4176656e676120436f72706f", "4176656e676120436f72706f"), "Avenga Corpo")
+        self.assertEqual(
+            _ssid("4176656e676120436f72706f", "4176656e676120436f72706f"),
+            "Avenga Corpo",
+        )
         self.assertEqual(_ssid("D0A2D0B5D181D182", "d0:a2:d0:b5:d1:81:d1:82"), "Тест")
 
     def test_hexadecimal_ssid_is_decoded_when_display_field_is_bytes(self):
         self.assertEqual(_ssid("4142", value_is_bytes=True), "AB")
         self.assertEqual(_ssid("31323334", value_is_bytes=True), "1234")
-        self.assertEqual(_ssid("4578616d706c6553534944", value_is_bytes=True), "ExampleSSID")
+        self.assertEqual(
+            _ssid("4578616d706c6553534944", value_is_bytes=True), "ExampleSSID"
+        )
 
     def test_ambiguous_hexadecimal_text_ssids_are_preserved(self):
         self.assertEqual(_ssid("Cafe"), "Cafe")
@@ -64,7 +91,9 @@ class ReviewFixTests(unittest.TestCase):
 
     def test_hidden_and_plain_text_ssids_are_preserved(self):
         self.assertEqual(_ssid(""), "<hidden>")
-        self.assertEqual(_ssid("Office Wi-Fi", "4f66666963652057692d4669"), "Office Wi-Fi")
+        self.assertEqual(
+            _ssid("Office Wi-Fi", "4f66666963652057692d4669"), "Office Wi-Fi"
+        )
 
     def test_raw_bytes_preserve_plain_hexadecimal_looking_ssids(self):
         self.assertEqual(_ssid("Cafe", "43616665"), "Cafe")
@@ -80,7 +109,9 @@ class ReviewFixTests(unittest.TestCase):
 
     def test_raw_ssid_is_authoritative_when_display_field_is_hex_or_wrong(self):
         self.assertEqual(_ssid("43616665", "3433363136363635"), "43616665")
-        self.assertEqual(_ssid("unhelpful", "53796e74686574696353534944"), "SyntheticSSID")
+        self.assertEqual(
+            _ssid("unhelpful", "53796e74686574696353534944"), "SyntheticSSID"
+        )
 
     def test_null_filled_ssids_are_hidden(self):
         self.assertEqual(_ssid("0000", "0000"), "<hidden>")
@@ -93,6 +124,16 @@ class ReviewFixTests(unittest.TestCase):
         app._events(capture)
         self.assertEqual(app.aps["AA"].ssid, "Office")
 
+    def test_event_drain_has_a_per_tick_budget(self):
+        app = self.make_app()
+        capture = Mock(events=queue.Queue())
+        for index in range(EVENTS_PER_TICK + 5):
+            capture.events.put(("AA", "Office", -50 + index % 2, 1, 2412))
+
+        app._events(capture)
+
+        self.assertEqual(capture.events.qsize(), 5)
+
     def test_scan_viewport_keeps_selection_visible(self):
         screen = FakeScreen(height=8)
         app = self.make_app(screen)
@@ -101,23 +142,31 @@ class ReviewFixTests(unittest.TestCase):
             app.aps[bssid] = AccessPoint(bssid, str(index), -30 - index, 1, 2412)
         app.selected = 8
         app._draw_scan()
-        highlighted = [text for _, text, attr in screen.writes if attr == curses.A_REVERSE]
+        highlighted = [
+            text for _, text, attr in screen.writes if attr & curses.A_REVERSE
+        ]
         self.assertEqual(len(highlighted), 1)
         self.assertIn("00:00:00:00:00:08", highlighted[0])
 
-    def test_scan_displays_and_sorts_by_recent_average(self):
+    def test_scan_displays_and_sorts_by_smoothed_average(self):
         screen = FakeScreen()
         app = self.make_app(screen)
         now = time.monotonic()
-        steady = AccessPoint("00:00:00:00:00:01", "steady", -50, 1, 2412, last_seen=now)
-        noisy = AccessPoint("00:00:00:00:00:02", "noisy", -80, 1, 2412, last_seen=now)
-        steady.rssi_history = deque([(now - 1, -50), (now, -50)])
-        noisy.rssi_history = deque([(now - 1, -10), (now, -80)])
+        steady = AccessPoint(
+            "00:00:00:00:00:01", "steady", -50, 1, 2412, last_seen=now, average=-50
+        )
+        noisy = AccessPoint(
+            "00:00:00:00:00:02", "noisy", -80, 1, 2412, last_seen=now, average=-45
+        )
         app.aps = {steady.bssid: steady, noisy.bssid: noisy}
 
         self.assertEqual([ap.ssid for ap in app._visible()], ["noisy", "steady"])
         app._draw_scan()
-        rows = [text for row, text, _ in screen.writes if row >= 3 and "00:00:00:00:00:" in text]
+        rows = [
+            text
+            for row, text, _ in screen.writes
+            if row >= 3 and "00:00:00:00:00:" in text
+        ]
         self.assertTrue(rows[0].startswith(" -45"))
 
     def test_scan_reserves_last_row_for_controls(self):
@@ -127,9 +176,20 @@ class ReviewFixTests(unittest.TestCase):
             bssid = f"00:00:00:00:00:{index:02X}"
             app.aps[bssid] = AccessPoint(bssid, str(index), -30 - index, 1, 2412)
         app._draw_scan()
-        access_point_rows = [row for row, text, _ in screen.writes if row >= 3 and "00:00:00:00:00:" in text]
+        access_point_rows = [
+            row
+            for row, text, _ in screen.writes
+            if row >= 3 and "00:00:00:00:00:" in text
+        ]
         self.assertEqual(access_point_rows, list(range(3, screen.height - 1)))
-        self.assertTrue(any(row == screen.height - 1 and "[Space] pause" in text and "[Q] quit" in text for row, text, _ in screen.writes))
+        self.assertTrue(
+            any(
+                row == screen.height - 1
+                and "[Space] pause" in text
+                and "[Q] quit" in text
+                for row, text, _ in screen.writes
+            )
+        )
 
     def test_space_pauses_scan_and_updates_controls(self):
         screen = FakeScreen()
@@ -141,6 +201,25 @@ class ReviewFixTests(unittest.TestCase):
         self.assertTrue(app.paused)
         self.assertIn("PAUSED", rendered)
         self.assertIn("[Space] resume", rendered)
+
+    def test_input_drains_a_bounded_burst_of_keys(self):
+        screen = FakeScreen()
+        screen.get_wch = Mock(side_effect=[curses.KEY_DOWN] * (KEYS_PER_TICK + 1))
+        app = self.make_app(screen)
+
+        app._input(Mock())
+
+        self.assertEqual(app.selected, KEYS_PER_TICK)
+        self.assertEqual(screen.get_wch.call_count, KEYS_PER_TICK)
+
+    def test_ctrl_c_character_stops_application(self):
+        screen = FakeScreen()
+        screen.key = "\x03"
+        app = self.make_app(screen)
+
+        self.assertTrue(app._keys(Mock()))
+
+        self.assertFalse(app.running)
 
     def test_filter_is_edited_only_after_f_and_enter_commits_it(self):
         screen = FakeScreen()
@@ -160,7 +239,11 @@ class ReviewFixTests(unittest.TestCase):
         screen.key = "f"
         app._keys(Mock())
         app._draw_scan()
-        fields = [text for row, text, attr in screen.writes if row == 0 and attr & curses.A_REVERSE]
+        fields = [
+            text
+            for row, text, attr in screen.writes
+            if row == 0 and attr & curses.A_REVERSE
+        ]
         self.assertEqual(fields, [" _ "])
 
     def test_pause_discards_events_and_freezes_visible_order(self):
@@ -197,7 +280,9 @@ class ReviewFixTests(unittest.TestCase):
         self.assertIsNone(app.paused_at)
 
         capture = Mock(events=queue.Queue())
-        capture.events.put((target.bssid, target.ssid, -25, target.channel, target.frequency))
+        capture.events.put(
+            (target.bssid, target.ssid, -25, target.channel, target.frequency)
+        )
         app._events(capture, apply=not app.paused)
         self.assertEqual(target.rssi, -25)
 
@@ -205,7 +290,9 @@ class ReviewFixTests(unittest.TestCase):
     @patch("fox80211.tui.curses.color_pair", return_value=0)
     def test_stale_hunt_does_not_beep(self, _color_pair, beep):
         app = self.make_app()
-        ap = AccessPoint("AA", "Office", -35, 1, 2412, last_seen=time.monotonic() - 3, average=-35)
+        ap = AccessPoint(
+            "AA", "Office", -35, 1, 2412, last_seen=time.monotonic() - 3, average=-35
+        )
         app.beep = True
         app._draw_hunt(ap)
         beep.assert_not_called()
@@ -229,15 +316,52 @@ class ReviewFixTests(unittest.TestCase):
             app._keys(Mock())
             self.assertEqual(app.filter, "tes")
 
-    def test_stale_access_points_sort_last_and_expire(self):
+    def test_old_access_points_keep_signal_order_and_expire(self):
         app = self.make_app()
         now = time.monotonic()
         app.aps["live"] = AccessPoint("live", "live", -70, 1, 2412, last_seen=now)
-        app.aps["stale"] = AccessPoint("stale", "stale", -20, 1, 2412, last_seen=now - 15)
-        self.assertEqual([ap.bssid for ap in app._visible()], ["live", "stale"])
-        app.aps["dead"] = AccessPoint("dead", "dead", -10, 1, 2412, last_seen=now - 31)
+        app.aps["old"] = AccessPoint("old", "old", -20, 1, 2412, last_seen=now - 61)
+        self.assertEqual([ap.bssid for ap in app._visible()], ["old", "live"])
+        app.aps["remembered"] = AccessPoint(
+            "remembered", "remembered", -10, 1, 2412, last_seen=now - 60
+        )
+        app.aps["dead"] = AccessPoint(
+            "dead", "dead", -10, 1, 2412, last_seen=now - EXPIRE_AFTER - 1
+        )
         app._events(Mock(events=queue.Queue()))
+        self.assertIn("remembered", app.aps)
         self.assertNotIn("dead", app.aps)
+
+    def test_scan_marks_network_not_seen_for_a_minute(self):
+        screen = FakeScreen()
+        app = self.make_app(screen)
+        now = time.monotonic()
+        app.aps["00:11:22:33:44:55"] = AccessPoint(
+            "00:11:22:33:44:55",
+            "Office",
+            -50,
+            100,
+            5500,
+            last_seen=now - 61,
+        )
+
+        with patch("fox80211.tui.time.monotonic", return_value=now):
+            app._draw_scan()
+
+        row = next(text for index, text, _ in screen.writes if index == 3)
+        self.assertIn("?  1m01", row)
+        controls = next(
+            text for index, text, _ in screen.writes if index == screen.height - 1
+        )
+        self.assertIn("? unseen 1m+", controls)
+
+    def test_signal_gradient_is_clamped_and_monotonic(self):
+        levels = [
+            signal_level(rssi, 16) for rssi in (-110, -90, -75, -60, -45, -25, -10)
+        ]
+        self.assertEqual(levels, sorted(levels))
+        self.assertEqual(levels[0], 0)
+        self.assertEqual(levels[-1], 15)
 
     def test_short_hunt_layout_does_not_write_outside_screen(self):
         app = self.make_app(FakeScreen(height=8, width=50))
@@ -251,6 +375,14 @@ class ReviewFixTests(unittest.TestCase):
         controls = [text for row, text, _ in screen.writes if row == 14]
         self.assertEqual(len(controls), 1)
         self.assertLessEqual(len(controls[0]), 47)
+
+    @patch("fox80211.tui.curses.color_pair", return_value=0)
+    def test_hunt_bar_uses_available_terminal_width(self, _color_pair):
+        screen = FakeScreen(height=15, width=160)
+        app = self.make_app(screen)
+        app._draw_hunt(AccessPoint("AA", "Office", -50, 1, 2412))
+        bar_segments = [text for row, text, _ in screen.writes if row == 7]
+        self.assertEqual(sum(map(len, bar_segments)), 156)
 
     def test_expiry_covers_complete_channel_sweep(self):
         self.assertGreaterEqual(scan_expiry(100), (HOP_DWELL + HOP_TUNE_BUDGET) * 100)
@@ -269,11 +401,24 @@ class ReviewFixTests(unittest.TestCase):
     def test_stale_hunt_displays_signal_lost(self, _color_pair):
         screen = FakeScreen()
         app = self.make_app(screen)
-        app._draw_hunt(AccessPoint("AA", "Office", -31, 124, 5620, last_seen=time.monotonic() - 3))
+        app._draw_hunt(
+            AccessPoint("AA", "Office", -31, 124, 5620, last_seen=time.monotonic() - 6)
+        )
         rendered = " ".join(text for _, text, _ in screen.writes)
         self.assertIn("SIGNAL LOST", rendered)
         self.assertIn("-- dBm", rendered)
         self.assertNotIn("VERY CLOSE", rendered)
+
+    @patch("fox80211.tui.curses.color_pair", return_value=0)
+    def test_five_ghz_hunt_tolerates_short_frame_gap(self, _color_pair):
+        screen = FakeScreen()
+        app = self.make_app(screen)
+        app._draw_hunt(
+            AccessPoint("AA", "Office", -31, 124, 5620, last_seen=time.monotonic() - 3)
+        )
+        rendered = " ".join(text for _, text, _ in screen.writes)
+        self.assertNotIn("SIGNAL LOST", rendered)
+        self.assertIn("VERY CLOSE", rendered)
 
     def test_failed_hunt_tune_returns_to_scan_with_error(self):
         screen = FakeScreen()
@@ -281,12 +426,16 @@ class ReviewFixTests(unittest.TestCase):
         app = self.make_app(screen)
         app.aps["AA"] = AccessPoint("AA", "Office", -40, 124, 5620)
         monitor = Mock()
-        monitor.set_frequency.side_effect = subprocess.CalledProcessError(1, ["iw"], stderr="Operation not permitted\n")
+        monitor.set_frequency.side_effect = subprocess.CalledProcessError(
+            1, ["iw"], stderr="Operation not permitted\n"
+        )
         app._keys(monitor)
         app.stop_event.wait = Mock(side_effect=lambda _timeout: app.stop_event.set())
         app._hop(monitor, [(5620, 124)])
         self.assertIsNone(app.hunt)
-        self.assertEqual(app.tune_error, "Unable to lock channel 124: Operation not permitted")
+        self.assertEqual(
+            app.tune_error, "Unable to lock channel 124: Operation not permitted"
+        )
         monitor.set_frequency.assert_called_once_with(5620)
 
     def test_busy_hunt_tune_is_retried(self):
@@ -296,7 +445,9 @@ class ReviewFixTests(unittest.TestCase):
         app.stop_event.wait = Mock(return_value=False)
         app.aps["AA"] = AccessPoint("AA", "Office", -40, 153, 5765)
         monitor = Mock()
-        busy = subprocess.CalledProcessError(1, ["iw"], stderr="command failed: Device or resource busy (-16)\n")
+        busy = subprocess.CalledProcessError(
+            1, ["iw"], stderr="command failed: Device or resource busy (-16)\n"
+        )
         monitor.set_frequency.side_effect = [busy, None]
 
         app._keys(monitor)
@@ -315,7 +466,9 @@ class ReviewFixTests(unittest.TestCase):
         self.assertIsNone(app.tune_error)
         self.assertEqual(app.current_frequency, 5765)
         self.assertEqual(monitor.set_frequency.call_count, 2)
-        self.assertIn(0.1, [call.args[0] for call in app.stop_event.wait.call_args_list])
+        self.assertIn(
+            0.1, [call.args[0] for call in app.stop_event.wait.call_args_list]
+        )
 
     def test_hunt_does_not_retune_frequency_already_locked_by_hopper(self):
         screen = FakeScreen()
@@ -356,7 +509,9 @@ class ReviewFixTests(unittest.TestCase):
         screen = FakeScreen()
         app = self.make_app(screen)
         app.locking_hunt = True
-        app._draw_hunt(AccessPoint("AA", "Office", -31, 153, 5765, last_seen=time.monotonic() - 3))
+        app._draw_hunt(
+            AccessPoint("AA", "Office", -31, 153, 5765, last_seen=time.monotonic() - 3)
+        )
         rendered = " ".join(text for _, text, _ in screen.writes)
         self.assertIn("LOCKING CHANNEL 153", rendered)
         self.assertNotIn("SIGNAL LOST", rendered)
@@ -397,9 +552,13 @@ class ReviewFixTests(unittest.TestCase):
         monitor.set_frequency.side_effect = subprocess.CalledProcessError(
             1, ["iw"], stderr="command failed: Device or resource busy (-16)\n"
         )
-        app.stop_event.wait = Mock(side_effect=lambda _timeout: setattr(app, "hunt", None))
+        app.stop_event.wait = Mock(
+            side_effect=lambda _timeout: setattr(app, "hunt", None)
+        )
 
-        locked = app._lock_frequency(monitor, target.frequency, cancelled=lambda: app.hunt is not target)
+        locked = app._lock_frequency(
+            monitor, target.frequency, cancelled=lambda: app.hunt is not target
+        )
 
         self.assertFalse(locked)
         self.assertIsNone(app.hunt)
@@ -445,7 +604,9 @@ class ReviewFixTests(unittest.TestCase):
         monitor = Mock()
         app._keys(monitor)
         self.assertIsNone(app.hunt)
-        self.assertEqual(app.tune_error, "Unable to lock channel: AA has no known frequency yet")
+        self.assertEqual(
+            app.tune_error, "Unable to lock channel: AA has no known frequency yet"
+        )
         monitor.set_frequency.assert_not_called()
 
     def test_capture_failure_is_reported(self):
@@ -460,7 +621,9 @@ class ReviewFixTests(unittest.TestCase):
         capture = TsharkCapture("mon0")
         capture.process = Mock(poll=Mock(return_value=2))
         capture.stderr.write("tshark: mon0: Permission denied\n0 packets captured\n")
-        with self.assertRaisesRegex(RuntimeError, "(?s)Permission denied.*0 packets captured"):
+        with self.assertRaisesRegex(
+            RuntimeError, "(?s)Permission denied.*0 packets captured"
+        ):
             capture.raise_if_failed()
         capture.stderr.close()
 
@@ -471,18 +634,24 @@ class ReviewFixTests(unittest.TestCase):
             returncode=0,
             stdout="F\tSSID\twlan.ssid\tFT_STRING\twlan\nF\tRaw SSID\twlan.ssid_raw\tFT_BYTES\twlan\n",
         )
-        self.assertEqual(_tshark_fields(), {"wlan.ssid": "FT_STRING", "wlan.ssid_raw": "FT_BYTES"})
+        self.assertEqual(
+            _tshark_fields(), {"wlan.ssid": "FT_STRING", "wlan.ssid_raw": "FT_BYTES"}
+        )
 
     @patch("fox80211.capture.subprocess.run")
     def test_tshark_field_discovery_is_cached(self, run):
         _tshark_fields.cache_clear()
-        run.return_value = Mock(returncode=0, stdout="F\tSSID\twlan.ssid\tFT_STRING\twlan\n")
+        run.return_value = Mock(
+            returncode=0, stdout="F\tSSID\twlan.ssid\tFT_STRING\twlan\n"
+        )
         self.assertEqual(_tshark_fields(), _tshark_fields())
         run.assert_called_once()
 
     @patch("fox80211.capture.subprocess.Popen")
     @patch("fox80211.capture._tshark_fields", return_value={"wlan.ssid": "FT_STRING"})
-    def test_capture_omits_raw_ssid_when_tshark_does_not_support_it(self, _fields, popen):
+    def test_capture_omits_raw_ssid_when_tshark_does_not_support_it(
+        self, _fields, popen
+    ):
         process = popen.return_value
         process.stdout = iter(())
         capture = TsharkCapture("mon0")
@@ -493,7 +662,9 @@ class ReviewFixTests(unittest.TestCase):
         capture.stderr.close()
 
     @patch("fox80211.capture.subprocess.Popen")
-    @patch("fox80211.capture._tshark_fields", return_value={"wlan.ssid_raw": "FT_BYTES"})
+    @patch(
+        "fox80211.capture._tshark_fields", return_value={"wlan.ssid_raw": "FT_BYTES"}
+    )
     def test_capture_uses_raw_ssid_when_tshark_supports_it(self, _fields, popen):
         process = popen.return_value
         process.stdout = iter(())
@@ -503,6 +674,74 @@ class ReviewFixTests(unittest.TestCase):
         command = popen.call_args.args[0]
         self.assertIn("wlan.ssid_raw", command)
         capture.stderr.close()
+
+    @patch("fox80211.capture.subprocess.Popen")
+    @patch("fox80211.capture._tshark_fields", return_value={"wlan.ssid": "FT_STRING"})
+    def test_hunt_capture_includes_all_target_bssid_frames(self, _fields, popen):
+        process = popen.return_value
+        process.stdout = iter(())
+        capture = TsharkCapture("mon0", "00:11:22:33:44:55")
+        capture.start()
+        capture.reader.join(timeout=1)
+        command = popen.call_args.args[0]
+        display_filter = command[command.index("-Y") + 1]
+        self.assertIn("wlan.fc.type_subtype == 8", display_filter)
+        self.assertIn("wlan.ta == 00:11:22:33:44:55", display_filter)
+        self.assertNotIn("wlan.bssid == 00:11:22:33:44:55", display_filter)
+        capture.stderr.close()
+
+    def test_hunt_capture_rejects_unsafe_bssid_filter(self):
+        with self.assertRaisesRegex(ValueError, "invalid BSSID"):
+            TsharkCapture("mon0", "00:11:22:33:44:55 || frame")
+
+    @patch("fox80211.capture.time.monotonic", side_effect=[10.0, 10.01, 10.06])
+    def test_hunt_capture_rate_limits_target_updates(self, _monotonic):
+        capture = TsharkCapture("mon0", "00:11:22:33:44:55")
+        event = ("00:11:22:33:44:55", "Office", -50, 100, 5500)
+
+        capture._emit(event)
+        capture._emit(event)
+        capture._emit(event)
+
+        self.assertEqual(capture.events.qsize(), 2)
+        capture.stderr.close()
+
+    def test_capture_queue_drops_oldest_event_when_full(self):
+        capture = TsharkCapture("mon0")
+        for index in range(EVENT_QUEUE_SIZE + 1):
+            capture._emit((str(index), "Office", index, 1, 2412))
+
+        self.assertEqual(capture.events.qsize(), EVENT_QUEUE_SIZE)
+        self.assertEqual(capture.events.get_nowait()[2], 1)
+        capture.stderr.close()
+
+    @patch("fox80211.tui.TsharkCapture")
+    def test_capture_filter_switch_starts_replacement_before_stopping_scan(
+        self, capture_class
+    ):
+        order = []
+        current = Mock()
+        current.stop.side_effect = lambda: order.append("old stop")
+        replacement = capture_class.return_value
+        replacement.start.side_effect = lambda: order.append("new start")
+
+        result = Application._replace_capture(current, "mon0", "00:11:22:33:44:55")
+
+        self.assertIs(result, replacement)
+        self.assertEqual(order, ["new start", "old stop"])
+        capture_class.assert_called_once_with("mon0", "00:11:22:33:44:55")
+
+    @patch("fox80211.tui.TsharkCapture")
+    def test_failed_capture_filter_switch_keeps_current_capture(self, capture_class):
+        current = Mock()
+        replacement = capture_class.return_value
+        replacement.start.side_effect = OSError("tshark failed")
+
+        with self.assertRaisesRegex(OSError, "tshark failed"):
+            Application._replace_capture(current, "mon0", "00:11:22:33:44:55")
+
+        current.stop.assert_not_called()
+        replacement.stop.assert_called_once_with()
 
     @patch("fox80211.system.run")
     def test_association_is_unknown_when_iw_fails(self, run):
@@ -522,6 +761,66 @@ class ReviewFixTests(unittest.TestCase):
         run("nmcli", "device")
         self.assertEqual(subprocess_run.call_args.kwargs["env"]["LC_ALL"], "C")
 
+    @patch("fox80211.cli.signal.signal")
+    def test_terminal_close_and_termination_use_cleanup_path(self, signal_handler):
+        _install_signal_handlers()
+
+        self.assertEqual(
+            [item.args[0] for item in signal_handler.call_args_list],
+            [signal.SIGHUP, signal.SIGTERM],
+        )
+        for item in signal_handler.call_args_list:
+            with self.assertRaises(KeyboardInterrupt):
+                item.args[1](item.args[0], None)
+
+    @patch("fox80211.system.Path.exists")
+    @patch("fox80211.system.run")
+    def test_only_dead_app_monitor_interfaces_are_removed(self, run, exists):
+        run.return_value = """\
+phy#1
+\tInterface whmon123
+\t\ttype monitor
+\tInterface whmon456
+\t\ttype monitor
+\tInterface monitor0
+\t\ttype monitor
+\tInterface whmon789
+\t\ttype managed
+"""
+        exists.side_effect = [False, True]
+
+        self.assertEqual(cleanup_orphan_monitors(), ["whmon123"])
+        self.assertIn(
+            call("iw", "dev", "whmon123", "del", check=False), run.call_args_list
+        )
+        self.assertNotIn(
+            call("iw", "dev", "whmon456", "del", check=False), run.call_args_list
+        )
+
+    @patch("fox80211.system._monitor_phys", return_value={"phy1"})
+    @patch("fox80211.system._interface_associated", return_value=False)
+    @patch("fox80211.system.run")
+    def test_app_monitor_vif_is_not_presented_as_adapter(
+        self, run, _associated, _monitor_phys
+    ):
+        run.return_value = """\
+phy#1
+\tInterface whmon123
+\t\ttype monitor
+\tInterface wlan1
+\t\ttype managed
+"""
+
+        adapters = discover_adapters()
+
+        self.assertEqual([adapter.interface for adapter in adapters], ["wlan1"])
+
+    @patch("fox80211.system.os.getpid", return_value=123456)
+    def test_monitor_name_contains_complete_owner_pid(self, _getpid):
+        monitor = MonitorInterface(Adapter("wlan1", "phy1"))
+
+        self.assertEqual(monitor.name, "whmon123456")
+
     @patch("fox80211.system.run")
     def test_available_frequencies_accepts_decimal_iw_output(self, run):
         run.return_value = """\
@@ -535,6 +834,44 @@ Band 1:
         self.assertEqual(available_frequencies("phy1"), [(2412, 1), (2462, 11)])
         run.assert_called_once_with("iw", "phy", "phy1", "info")
 
+    @patch("fox80211.system.run", return_value="yes\n")
+    def test_networkmanager_status_uses_current_field_name(self, run):
+        monitor = MonitorInterface(Adapter("wlan1", "phy1"))
+
+        self.assertTrue(monitor._nm_managed("wlan1"))
+        run.assert_called_once_with(
+            "nmcli", "-g", "GENERAL.NM-MANAGED", "device", "show", "wlan1"
+        )
+
+    @patch("fox80211.system.run")
+    def test_networkmanager_status_falls_back_to_legacy_field_name(self, run):
+        modern = subprocess.CalledProcessError(2, ["nmcli", "-g", "GENERAL.NM-MANAGED"])
+        run.side_effect = [modern, "no\n"]
+        monitor = MonitorInterface(Adapter("wlan1", "phy1"))
+
+        self.assertFalse(monitor._nm_managed("wlan1"))
+        self.assertEqual(
+            run.call_args_list,
+            [
+                call(
+                    "nmcli",
+                    "-g",
+                    "GENERAL.NM-MANAGED",
+                    "device",
+                    "show",
+                    "wlan1",
+                ),
+                call(
+                    "nmcli",
+                    "-g",
+                    "GENERAL.MANAGED",
+                    "device",
+                    "show",
+                    "wlan1",
+                ),
+            ],
+        )
+
     @patch("fox80211.system._link_is_up", return_value=True)
     @patch("fox80211.system.run")
     def test_partial_monitor_setup_is_restored(self, run, _link_is_up):
@@ -544,14 +881,16 @@ Band 1:
             calls.append(args)
             if args[:4] == ("iw", "phy", "phy1", "interface"):
                 raise subprocess.CalledProcessError(1, args)
-            if args[:4] == ("nmcli", "-g", "GENERAL.MANAGED", "device"):
+            if args[:4] == ("nmcli", "-g", "GENERAL.NM-MANAGED", "device"):
                 return "yes\n"
             if args[:6] == ("iw", "dev", "wlan1", "set", "type", "monitor"):
                 raise subprocess.CalledProcessError(1, args)
             return ""
 
         run.side_effect = command
-        monitor = MonitorInterface(Adapter("wlan1", "phy1", mode="managed", connection_known=True))
+        monitor = MonitorInterface(
+            Adapter("wlan1", "phy1", mode="managed", connection_known=True)
+        )
         with self.assertRaises(subprocess.CalledProcessError):
             monitor.__enter__()
         self.assertIn(("iw", "dev", "wlan1", "set", "type", "managed"), calls)
@@ -567,12 +906,14 @@ Band 1:
             calls.append(args)
             if args[:4] == ("iw", "phy", "phy1", "interface"):
                 raise subprocess.CalledProcessError(1, args)
-            if args[:4] == ("nmcli", "-g", "GENERAL.MANAGED", "device"):
+            if args[:4] == ("nmcli", "-g", "GENERAL.NM-MANAGED", "device"):
                 return "no\n"
             return ""
 
         run.side_effect = command
-        monitor = MonitorInterface(Adapter("wlan1", "phy1", mode="managed", connection_known=True))
+        monitor = MonitorInterface(
+            Adapter("wlan1", "phy1", mode="managed", connection_known=True)
+        )
         with monitor:
             pass
         restore_type = calls.index(("iw", "dev", "wlan1", "set", "type", "managed"))
@@ -581,19 +922,26 @@ Band 1:
 
     @patch("fox80211.system._link_is_up", return_value=True)
     @patch("fox80211.system.run")
-    def test_separate_vif_isolates_and_restores_original_interface(self, run, _link_is_up):
+    def test_separate_vif_isolates_and_restores_original_interface(
+        self, run, _link_is_up
+    ):
         calls = []
 
         def command(*args, check=True):
             calls.append(args)
-            if args[:4] == ("nmcli", "-g", "GENERAL.MANAGED", "device"):
+            if args[:4] == ("nmcli", "-g", "GENERAL.NM-MANAGED", "device"):
                 return "yes\n"
             return ""
 
         run.side_effect = command
         with MonitorInterface(Adapter("wlan1", "phy1")) as monitor:
             name = monitor.name
-        self.assertLess(calls.index(("nmcli", "device", "set", "wlan1", "managed", "no")), calls.index(("iw", "phy", "phy1", "interface", "add", name, "type", "monitor")))
+        self.assertLess(
+            calls.index(("nmcli", "device", "set", "wlan1", "managed", "no")),
+            calls.index(
+                ("iw", "phy", "phy1", "interface", "add", name, "type", "monitor")
+            ),
+        )
         self.assertIn(("ip", "link", "set", "wlan1", "down"), calls)
         self.assertIn(("ip", "link", "set", "wlan1", "up"), calls)
         self.assertIn(("nmcli", "device", "set", "wlan1", "managed", "yes"), calls)
