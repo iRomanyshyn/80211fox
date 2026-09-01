@@ -54,11 +54,14 @@ class Application:
         self.adapter = adapter
         self.aps: dict[str, AccessPoint] = {}
         self.filter = ""
+        self.filter_editing = False
+        self.filter_before_edit = ""
         self.selected = 0
         self.running = True
         self.hunt: AccessPoint | None = None
         self.beep = False
         self.paused = False
+        self.paused_at: float | None = None
         self.last_beep = 0.0
         self.stop_event = threading.Event()
         self.tune_lock = threading.Lock()
@@ -87,7 +90,7 @@ class Application:
                 self.screen.nodelay(True)
                 while self.running:
                     capture.raise_if_failed()
-                    self._events(capture)
+                    self._events(capture, apply=not self.paused)
                     self._keys(monitor)
                     self._draw()
                     time.sleep(0.05)
@@ -108,7 +111,7 @@ class Application:
                         break
                     try:
                         with self.tune_lock:
-                            if self.hunt is None:
+                            if self.hunt is None and not self.paused:
                                 monitor.set_frequency(frequency)
                                 self.current_frequency = frequency
                                 self.usable_frequencies.add(frequency)
@@ -120,12 +123,17 @@ class Application:
             else:
                 self.stop_event.wait(0.1)
 
-    def _events(self, capture: TsharkCapture) -> None:
+    def _events(self, capture: TsharkCapture, apply: bool = True) -> None:
         while True:
             try:
                 bssid, ssid, rssi, channel, frequency = capture.events.get_nowait()
             except queue.Empty:
                 break
+            # Keep draining the bounded capture path while paused, but do not
+            # let packets received on the last tuned channel change the frozen
+            # scan view.
+            if not apply:
+                continue
             ap = self.aps.get(bssid)
             if ap:
                 if ssid != "<hidden>" or ap.ssid == "<hidden>":
@@ -133,13 +141,28 @@ class Application:
                 ap.update(rssi, channel, frequency)
             else:
                 self.aps[bssid] = AccessPoint(bssid, ssid, rssi, channel, frequency, average=float(rssi), minimum=rssi, maximum=rssi)
-        now = time.monotonic()
-        self.aps = {bssid: ap for bssid, ap in self.aps.items() if ap is self.hunt or now - ap.last_seen <= self.expire_after}
+        if apply:
+            now = time.monotonic()
+            self.aps = {bssid: ap for bssid, ap in self.aps.items() if ap is self.hunt or now - ap.last_seen <= self.expire_after}
 
     def _keys(self, monitor: MonitorInterface) -> None:
         try:
             key = self.screen.get_wch()
         except curses.error:
+            return
+        if self.filter_editing:
+            if key in ("\n", "\r", 10, 13):
+                self.filter_editing = False
+            elif key in (27, "\x1b"):
+                self.filter = self.filter_before_edit
+                self.filter_editing = False
+                self.selected = 0
+            elif key in (curses.KEY_BACKSPACE, 127, 8, "\x7f", "\b"):
+                self.filter = self.filter[:-1]
+                self.selected = 0
+            elif isinstance(key, str) and key.isprintable():
+                self.filter += key
+                self.selected = 0
             return
         if key in ("q", "Q"):
             self.running = False
@@ -153,6 +176,10 @@ class Application:
                 ap.samples, ap.minimum, ap.maximum, ap.average = 1, ap.rssi, ap.rssi, float(ap.rssi)
         elif key == " ":
             self.paused = not self.paused
+            self.paused_at = time.monotonic() if self.paused else None
+        elif key in ("f", "F"):
+            self.filter_editing = True
+            self.filter_before_edit = self.filter
         elif key == curses.KEY_UP:
             self.selected = max(0, self.selected - 1)
         elif key == curses.KEY_DOWN:
@@ -165,6 +192,10 @@ class Application:
                     self.tune_error = f"Unable to lock channel: {target.bssid} has no known frequency yet"
                     self.hunt = None
                 else:
+                    # HUNT is a live view even when it is entered from a frozen
+                    # scan, so resume capture updates before locking the target.
+                    self.paused = False
+                    self.paused_at = None
                     # Publish HUNT first, then wait for an outstanding hopping
                     # tune before locking the target frequency.
                     self.hunt = target
@@ -176,10 +207,6 @@ class Application:
                         except Exception as error:
                             self.tune_error = f"Unable to lock channel {target.channel or '?'}: {command_error(error)}"
                             self.hunt = None
-        elif key in (curses.KEY_BACKSPACE, 127, 8, "\x7f", "\b"):
-            self.filter = self.filter[:-1]
-        elif isinstance(key, str) and key.isprintable():
-            self.filter += key
 
     def _lock_frequency(self, monitor: MonitorInterface, frequency: int) -> None:
         """Tune for hunt mode, retrying the driver's transient busy response."""
@@ -193,7 +220,7 @@ class Application:
                 self.stop_event.wait(LOCK_RETRY_DELAY)
 
     def _visible(self) -> list[AccessPoint]:
-        now = time.monotonic()
+        now = self.paused_at if self.paused_at is not None else time.monotonic()
         return sorted(
             (ap for ap in self.aps.values() if ap.matches(self.filter)),
             key=lambda ap: (now - ap.last_seen >= STALE_AFTER, -ap.recent_rssi(SCAN_RSSI_WINDOW, now)),
@@ -214,7 +241,11 @@ class Application:
 
     def _draw_scan(self) -> None:
         state = "PAUSED" if self.paused else "SCANNING"
-        self.screen.addstr(0, 0, f"{state}  {self.adapter.interface}/{self.adapter.phy}   filter: {self.filter}_", curses.A_BOLD)
+        prefix = f"{state}  {self.adapter.interface}/{self.adapter.phy}   filter: "
+        self.screen.addstr(0, 0, prefix, curses.A_BOLD)
+        field = f" {self.filter}{'_' if self.filter_editing else ''} "
+        field_attr = curses.A_REVERSE | curses.A_BOLD if self.filter_editing else curses.A_BOLD
+        self.screen.addnstr(0, len(prefix), field, max(0, self.screen.getmaxyx()[1] - len(prefix) - 1), field_attr)
         total = len(self.channel_by_frequency)
         current = self.channel_by_frequency.get(self.current_frequency or 0, "?")
         self.screen.addstr(1, 0, f"Channels: {total} available / {len(self.usable_frequencies)} usable / {len(self.rejected_frequencies)} rejected   Current: {current} ({self.current_frequency or '?'} MHz)")
@@ -228,14 +259,14 @@ class Application:
         offset = min(max(0, self.selected - page_size + 1), max(0, len(visible) - page_size))
         for row, ap in enumerate(visible[offset : offset + page_size]):
             index = offset + row
-            now = time.monotonic()
+            now = self.paused_at if self.paused_at is not None else time.monotonic()
             age = now - ap.last_seen
             rssi = round(ap.recent_rssi(SCAN_RSSI_WINDOW, now))
             line = f"{rssi:4}  {str(ap.channel or '?'):>4}  {str(ap.frequency or '?'):>5}  {ap.bssid:17}  {ap.ssid:25.25}  {age:5.1f}s"
             attr = curses.A_REVERSE if index == self.selected else (curses.A_DIM if age >= STALE_AFTER else 0)
             self.screen.addnstr(3 + row, 0, line, width - 1, attr)
         action = "resume" if self.paused else "pause"
-        self.screen.addnstr(height - 1, 0, f"[Space] {action}   [Enter] hunt selected network   [Q] quit", width - 1, curses.A_BOLD)
+        self.screen.addnstr(height - 1, 0, f"[F] filter   [Space] {action}   [Enter] hunt selected network   [Q] quit", width - 1, curses.A_BOLD)
 
     def _draw_hunt(self, ap: AccessPoint) -> None:
         height, terminal_width = self.screen.getmaxyx()

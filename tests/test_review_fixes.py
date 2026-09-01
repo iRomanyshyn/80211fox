@@ -142,14 +142,64 @@ class ReviewFixTests(unittest.TestCase):
         self.assertIn("PAUSED", rendered)
         self.assertIn("[Space] resume", rendered)
 
-    def test_j_and_k_are_available_to_filter(self):
+    def test_filter_is_edited_only_after_f_and_enter_commits_it(self):
         screen = FakeScreen()
         app = self.make_app(screen)
         monitor = Mock()
-        for character in "jk":
+        for character in "FMy WiFi Q\n":
             screen.key = character
             app._keys(monitor)
-        self.assertEqual(app.filter, "jk")
+        self.assertEqual(app.filter, "My WiFi Q")
+        self.assertFalse(app.filter_editing)
+        self.assertTrue(app.running)
+        monitor.set_frequency.assert_not_called()
+
+    def test_filter_field_is_highlighted_while_editing(self):
+        screen = FakeScreen()
+        app = self.make_app(screen)
+        screen.key = "f"
+        app._keys(Mock())
+        app._draw_scan()
+        fields = [text for row, text, attr in screen.writes if row == 0 and attr & curses.A_REVERSE]
+        self.assertEqual(fields, [" _ "])
+
+    def test_pause_discards_events_and_freezes_visible_order(self):
+        screen = FakeScreen()
+        app = self.make_app(screen)
+        now = time.monotonic()
+        first = AccessPoint("01", "first", -40, 1, 2412, last_seen=now)
+        second = AccessPoint("02", "second", -50, 1, 2412, last_seen=now)
+        app.aps = {first.bssid: first, second.bssid: second}
+        screen.key = " "
+        with patch("fox80211.tui.time.monotonic", return_value=now):
+            app._keys(Mock())
+        capture = Mock(events=queue.Queue())
+        capture.events.put((second.bssid, second.ssid, -10, 1, 2412))
+        app._events(capture, apply=not app.paused)
+        with patch("fox80211.tui.time.monotonic", return_value=now + 20):
+            self.assertEqual([ap.bssid for ap in app._visible()], ["01", "02"])
+        self.assertEqual(second.rssi, -50)
+        self.assertTrue(capture.events.empty())
+
+    def test_starting_hunt_from_paused_scan_resumes_capture_updates(self):
+        screen = FakeScreen()
+        app = self.make_app(screen)
+        target = AccessPoint("AA", "Office", -40, 124, 5620)
+        app.aps[target.bssid] = target
+        app.paused = True
+        app.paused_at = time.monotonic()
+        screen.key = "\n"
+
+        app._keys(Mock())
+
+        self.assertIs(app.hunt, target)
+        self.assertFalse(app.paused)
+        self.assertIsNone(app.paused_at)
+
+        capture = Mock(events=queue.Queue())
+        capture.events.put((target.bssid, target.ssid, -25, target.channel, target.frequency))
+        app._events(capture, apply=not app.paused)
+        self.assertEqual(target.rssi, -25)
 
     @patch("fox80211.sound.curses.beep")
     @patch("fox80211.tui.curses.color_pair", return_value=0)
@@ -163,6 +213,8 @@ class ReviewFixTests(unittest.TestCase):
     def test_unicode_filter_input(self):
         screen = FakeScreen()
         app = self.make_app(screen)
+        screen.key = "f"
+        app._keys(Mock())
         screen.key = "ї"
         app._keys(Mock())
         self.assertEqual(app.filter, "ї")
@@ -172,6 +224,7 @@ class ReviewFixTests(unittest.TestCase):
         app = self.make_app(screen)
         for backspace in ("\x7f", "\b"):
             app.filter = "test"
+            app.filter_editing = True
             screen.key = backspace
             app._keys(Mock())
             self.assertEqual(app.filter, "tes")
