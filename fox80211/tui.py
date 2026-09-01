@@ -192,6 +192,10 @@ class Application:
                     self.tune_error = f"Unable to lock channel: {target.bssid} has no known frequency yet"
                     self.hunt = None
                 else:
+                    # HUNT is a live view even when it is entered from a frozen
+                    # scan, so resume capture updates before locking the target.
+                    self.paused = False
+                    self.paused_at = None
                     # Publish HUNT first, then wait for an outstanding hopping
                     # tune before locking the target frequency.
                     self.hunt = target

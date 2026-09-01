@@ -181,6 +181,26 @@ class ReviewFixTests(unittest.TestCase):
         self.assertEqual(second.rssi, -50)
         self.assertTrue(capture.events.empty())
 
+    def test_starting_hunt_from_paused_scan_resumes_capture_updates(self):
+        screen = FakeScreen()
+        app = self.make_app(screen)
+        target = AccessPoint("AA", "Office", -40, 124, 5620)
+        app.aps[target.bssid] = target
+        app.paused = True
+        app.paused_at = time.monotonic()
+        screen.key = "\n"
+
+        app._keys(Mock())
+
+        self.assertIs(app.hunt, target)
+        self.assertFalse(app.paused)
+        self.assertIsNone(app.paused_at)
+
+        capture = Mock(events=queue.Queue())
+        capture.events.put((target.bssid, target.ssid, -25, target.channel, target.frequency))
+        app._events(capture, apply=not app.paused)
+        self.assertEqual(target.rssi, -25)
+
     @patch("fox80211.sound.curses.beep")
     @patch("fox80211.tui.curses.color_pair", return_value=0)
     def test_stale_hunt_does_not_beep(self, _color_pair, beep):
