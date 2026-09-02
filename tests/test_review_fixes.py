@@ -394,6 +394,33 @@ class ReviewFixTests(unittest.TestCase):
         )
         self.assertIn("2:on 5:off 6:on", controls)
 
+    def test_disabled_band_is_skipped_by_channel_hopper(self):
+        screen = FakeScreen()
+        app = self.make_app(screen)
+        screen.key = "5"
+        app._keys(Mock())
+        monitor = Mock()
+        app.stop_event.wait = Mock(
+            side_effect=lambda _timeout: app.stop_event.set()
+        )
+
+        app._hop(monitor, [(5500, 100), (2412, 1)])
+
+        monitor.set_frequency.assert_called_once_with(2412)
+
+    def test_hopper_waits_without_tuning_when_all_bands_are_disabled(self):
+        app = self.make_app()
+        app.enabled_bands.clear()
+        monitor = Mock()
+        app.stop_event.wait = Mock(
+            side_effect=lambda _timeout: app.stop_event.set()
+        )
+
+        app._hop(monitor, [(2412, 1), (5500, 100), (6115, 33)])
+
+        monitor.set_frequency.assert_not_called()
+        app.stop_event.wait.assert_called_once_with(0.1)
+
     def test_scan_reset_key_clears_discovered_networks(self):
         screen = FakeScreen()
         app = self.make_app(screen)

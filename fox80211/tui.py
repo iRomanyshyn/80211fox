@@ -177,12 +177,22 @@ class Application:
                 self.stop_event.wait(0.1)
                 continue
             if self.hunt is None:
+                scanned_frequency = False
                 for frequency, _ in frequencies:
                     if self.stop_event.is_set() or self.hunt is not None or self.paused:
                         break
+                    band = network_band(frequency)
+                    if band is not None and band not in self.enabled_bands:
+                        continue
+                    scanned_frequency = True
                     try:
                         with self.tune_lock:
-                            if self.hunt is None and not self.paused:
+                            band = network_band(frequency)
+                            if (
+                                self.hunt is None
+                                and not self.paused
+                                and (band is None or band in self.enabled_bands)
+                            ):
                                 monitor.set_frequency(frequency)
                                 self.current_frequency = frequency
                                 self.usable_frequencies.add(frequency)
@@ -191,6 +201,9 @@ class Application:
                         self.usable_frequencies.discard(frequency)
                         self.rejected_frequencies[frequency] = command_error(error)
                     self.stop_event.wait(HOP_DWELL)
+                if not scanned_frequency:
+                    # Avoid a busy loop when every known band is disabled.
+                    self.stop_event.wait(0.1)
             else:
                 target = self.hunt
                 if target is None:
