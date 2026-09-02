@@ -95,6 +95,7 @@ class Application:
         self.filter_editing = False
         self.filter_before_edit = ""
         self.enabled_bands = set(BANDS)
+        self.clear_scan_requested = False
         self.selected = 0
         self.running = True
         self.hunt: AccessPoint | None = None
@@ -227,6 +228,17 @@ class Application:
                 self.stop_event.wait(0.1)
 
     def _events(self, capture: TsharkCapture, apply: bool = True) -> None:
+        if self.clear_scan_requested:
+            # Discard exactly the observations that were already queued when
+            # reset was requested. Frames arriving after this snapshot belong
+            # to the new scan and may be applied on the next UI tick.
+            for _ in range(capture.events.qsize()):
+                try:
+                    capture.events.get_nowait()
+                except queue.Empty:
+                    break
+            self.clear_scan_requested = False
+            return
         for _ in range(EVENTS_PER_TICK):
             try:
                 bssid, ssid, rssi, channel, frequency = capture.events.get_nowait()
@@ -317,6 +329,7 @@ class Application:
         elif key in ("r", "R"):
             self.aps.clear()
             self.selected = 0
+            self.clear_scan_requested = True
         elif key == curses.KEY_UP:
             self.selected = max(0, self.selected - 1)
         elif key == curses.KEY_DOWN:
@@ -444,14 +457,10 @@ class Application:
                 attr |= curses.A_REVERSE
             self.screen.addnstr(3 + row, 0, line, width - 1, attr)
         action = "resume" if self.paused else "pause"
-        band_controls = " ".join(
-            f"[{band}:{'on' if band in self.enabled_bands else 'off'}]"
-            for band in BANDS
-        )
         self.screen.addnstr(
             height - 1,
             0,
-            f"{band_controls}  [F] filter  [R] clear  [Space] {action}  [Enter] hunt  [Q] quit  dim=unseen 1m+",
+            scan_controls(action, self.enabled_bands, width - 1),
             width - 1,
             curses.A_BOLD,
         )
@@ -561,6 +570,25 @@ def network_band(frequency: int | None) -> int | None:
     if 5925 <= frequency <= 7125:
         return 6
     return None
+
+
+def scan_controls(action: str, enabled_bands: set[int], width: int) -> str:
+    """Build a footer that keeps critical controls visible on narrow screens."""
+    variants = (
+        f"[F] filter [R] clear [Space] {action} [Enter] hunt [Q] quit",
+        f"[R] clear [Space] {action} [Enter] hunt [Q] quit",
+        f"[R] clear [Enter] hunt [Q] quit",
+        "[R] clear [Q] quit",
+        "[Q] quit",
+    )
+    controls = next((item for item in variants if len(item) <= width), variants[-1])
+    bands = " ".join(
+        f"{band}:{'on' if band in enabled_bands else 'off'}" for band in BANDS
+    )
+    for suffix in (f"  {bands}  dim=unseen 1m+", f"  {bands}"):
+        if len(controls) + len(suffix) <= width:
+            return controls + suffix
+    return controls
 
 
 def signal_level(rssi: float, levels: int) -> int:
