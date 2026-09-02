@@ -13,6 +13,7 @@ from .sound import SoundBackend, TerminalBell
 from .system import MonitorInterface, available_frequencies
 
 UNCERTAIN_AFTER = 60.0
+BANDS = (2, 5, 6)
 EXPIRE_AFTER = 30.0 * 60.0
 LOST_AFTER = 2.0
 FIVE_GHZ_LOST_AFTER = 5.0
@@ -93,6 +94,7 @@ class Application:
         self.filter = ""
         self.filter_editing = False
         self.filter_before_edit = ""
+        self.enabled_bands = set(BANDS)
         self.selected = 0
         self.running = True
         self.hunt: AccessPoint | None = None
@@ -305,6 +307,16 @@ class Application:
         elif key in ("f", "F"):
             self.filter_editing = True
             self.filter_before_edit = self.filter
+        elif key in ("2", "5", "6"):
+            band = int(key)
+            if band in self.enabled_bands:
+                self.enabled_bands.remove(band)
+            else:
+                self.enabled_bands.add(band)
+            self.selected = 0
+        elif key in ("r", "R"):
+            self.aps.clear()
+            self.selected = 0
         elif key == curses.KEY_UP:
             self.selected = max(0, self.selected - 1)
         elif key == curses.KEY_DOWN:
@@ -352,8 +364,16 @@ class Application:
         return False
 
     def _visible(self) -> list[AccessPoint]:
+        def band_is_visible(ap: AccessPoint) -> bool:
+            band = network_band(ap.frequency)
+            return band is None or band in self.enabled_bands
+
         return sorted(
-            (ap for ap in self.aps.values() if ap.matches(self.filter)),
+            (
+                ap
+                for ap in self.aps.values()
+                if ap.matches(self.filter) and band_is_visible(ap)
+            ),
             key=lambda ap: (-smoothed_rssi(ap), ap.bssid),
         )
 
@@ -417,15 +437,21 @@ class Application:
             rssi = round(smoothed_rssi(ap))
             uncertain = "?" if age >= UNCERTAIN_AFTER else " "
             line = f"{rssi:4}  {str(ap.channel or '?'):>4}  {str(ap.frequency or '?'):>5}  {ap.bssid:17}  {ap.ssid:25.25}  {uncertain}{format_age(age)}"
-            attr = scan_signal_attr(rssi)
+            # Stale observations must be visually distinct from live signal
+            # strength, so do not retain a signal-gradient colour for them.
+            attr = curses.A_DIM if age >= UNCERTAIN_AFTER else scan_signal_attr(rssi)
             if index == self.selected:
                 attr |= curses.A_REVERSE
             self.screen.addnstr(3 + row, 0, line, width - 1, attr)
         action = "resume" if self.paused else "pause"
+        band_controls = " ".join(
+            f"[{band}:{'on' if band in self.enabled_bands else 'off'}]"
+            for band in BANDS
+        )
         self.screen.addnstr(
             height - 1,
             0,
-            f"[F] filter   [Space] {action}   [Enter] hunt   [Q] quit   ? unseen 1m+",
+            f"{band_controls}  [F] filter  [R] clear  [Space] {action}  [Enter] hunt  [Q] quit  dim=unseen 1m+",
             width - 1,
             curses.A_BOLD,
         )
@@ -522,6 +548,19 @@ def scan_expiry(frequency_count: int) -> float:
 
 def smoothed_rssi(ap: AccessPoint) -> float:
     return ap.average if ap.average is not None else float(ap.rssi)
+
+
+def network_band(frequency: int | None) -> int | None:
+    """Return the conventional Wi-Fi band for a center frequency in MHz."""
+    if frequency is None:
+        return None
+    if 2400 <= frequency < 2500:
+        return 2
+    if 4900 <= frequency < 5925:
+        return 5
+    if 5925 <= frequency <= 7125:
+        return 6
+    return None
 
 
 def signal_level(rssi: float, levels: int) -> int:

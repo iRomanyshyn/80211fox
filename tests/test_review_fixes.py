@@ -29,6 +29,7 @@ from fox80211.tui import (
     KEYS_PER_TICK,
     LOCK_ATTEMPTS,
     Application,
+    network_band,
     scan_expiry,
     signal_level,
 )
@@ -348,12 +349,55 @@ class ReviewFixTests(unittest.TestCase):
         with patch("fox80211.tui.time.monotonic", return_value=now):
             app._draw_scan()
 
-        row = next(text for index, text, _ in screen.writes if index == 3)
+        row, attributes = next(
+            (text, attributes)
+            for index, text, attributes in screen.writes
+            if index == 3
+        )
         self.assertIn("?  1m01", row)
+        self.assertTrue(attributes & curses.A_DIM)
         controls = next(
             text for index, text, _ in screen.writes if index == screen.height - 1
         )
-        self.assertIn("? unseen 1m+", controls)
+        self.assertIn("dim=unseen 1m+", controls)
+
+    def test_number_keys_toggle_band_filters(self):
+        screen = FakeScreen()
+        app = self.make_app(screen)
+        for band, frequency in ((2, 2412), (5, 5500), (6, 6115)):
+            bssid = str(band)
+            app.aps[bssid] = AccessPoint(bssid, f"{band} GHz", -50, 1, frequency)
+        app.aps["unknown"] = AccessPoint("unknown", "unknown", -50, 1, None)
+
+        screen.key = "5"
+        app._keys(Mock())
+
+        self.assertEqual(
+            {ap.bssid for ap in app._visible()}, {"2", "6", "unknown"}
+        )
+        app._draw_scan()
+        controls = next(
+            text for row, text, _ in screen.writes if row == screen.height - 1
+        )
+        self.assertIn("[2:on] [5:off] [6:on]", controls)
+
+    def test_scan_reset_key_clears_discovered_networks(self):
+        screen = FakeScreen()
+        app = self.make_app(screen)
+        app.aps["AA"] = AccessPoint("AA", "Office", -50, 1, 2412)
+        app.selected = 3
+        screen.key = "r"
+
+        app._keys(Mock())
+
+        self.assertEqual(app.aps, {})
+        self.assertEqual(app.selected, 0)
+
+    def test_network_band_uses_frequency_boundaries(self):
+        self.assertEqual(network_band(2412), 2)
+        self.assertEqual(network_band(5500), 5)
+        self.assertEqual(network_band(5955), 6)
+        self.assertIsNone(network_band(None))
 
     def test_signal_gradient_is_clamped_and_monotonic(self):
         levels = [
