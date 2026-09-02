@@ -334,10 +334,14 @@ class Application:
             self.filter_before_edit = self.filter
         elif key in ("2", "5", "6"):
             band = int(key)
-            if band in self.enabled_bands:
-                self.enabled_bands.remove(band)
-            else:
-                self.enabled_bands.add(band)
+            # Serialize band changes with channel tuning. This makes the band
+            # check in the hopper and the subsequent set-frequency command a
+            # single operation from the UI's point of view.
+            with self.tune_lock:
+                if band in self.enabled_bands:
+                    self.enabled_bands.remove(band)
+                else:
+                    self.enabled_bands.add(band)
             self.selected = 0
         elif key in ("r", "R"):
             self.aps.clear()
