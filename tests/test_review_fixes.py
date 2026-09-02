@@ -29,6 +29,8 @@ from fox80211.tui import (
     KEYS_PER_TICK,
     LOCK_ATTEMPTS,
     Application,
+    network_band,
+    scan_controls,
     scan_expiry,
     signal_level,
 )
@@ -191,6 +193,18 @@ class ReviewFixTests(unittest.TestCase):
             )
         )
 
+    def test_scan_prioritizes_essential_controls_at_narrow_widths(self):
+        controls = scan_controls("pause", {2, 5, 6}, 59)
+        self.assertIn("[Enter] hunt", controls)
+        self.assertIn("[Q] quit", controls)
+        self.assertLessEqual(len(controls), 59)
+
+    def test_scan_shows_compact_band_status_at_eighty_columns(self):
+        controls = scan_controls("pause", {2, 6}, 79)
+        self.assertIn("2:on 5:off 6:on", controls)
+        self.assertIn("[Q] quit", controls)
+        self.assertLessEqual(len(controls), 79)
+
     def test_space_pauses_scan_and_updates_controls(self):
         screen = FakeScreen()
         app = self.make_app(screen)
@@ -348,12 +362,69 @@ class ReviewFixTests(unittest.TestCase):
         with patch("fox80211.tui.time.monotonic", return_value=now):
             app._draw_scan()
 
-        row = next(text for index, text, _ in screen.writes if index == 3)
+        row, attributes = next(
+            (text, attributes)
+            for index, text, attributes in screen.writes
+            if index == 3
+        )
         self.assertIn("?  1m01", row)
+        self.assertTrue(attributes & curses.A_DIM)
         controls = next(
             text for index, text, _ in screen.writes if index == screen.height - 1
         )
-        self.assertIn("? unseen 1m+", controls)
+        self.assertIn("dim=unseen 1m+", controls)
+
+    def test_number_keys_toggle_band_filters(self):
+        screen = FakeScreen()
+        app = self.make_app(screen)
+        for band, frequency in ((2, 2412), (5, 5500), (6, 6115)):
+            bssid = str(band)
+            app.aps[bssid] = AccessPoint(bssid, f"{band} GHz", -50, 1, frequency)
+        app.aps["unknown"] = AccessPoint("unknown", "unknown", -50, 1, None)
+
+        screen.key = "5"
+        app._keys(Mock())
+
+        self.assertEqual(
+            {ap.bssid for ap in app._visible()}, {"2", "6", "unknown"}
+        )
+        app._draw_scan()
+        controls = next(
+            text for row, text, _ in screen.writes if row == screen.height - 1
+        )
+        self.assertIn("2:on 5:off 6:on", controls)
+
+    def test_scan_reset_key_clears_discovered_networks(self):
+        screen = FakeScreen()
+        app = self.make_app(screen)
+        app.aps["AA"] = AccessPoint("AA", "Office", -50, 1, 2412)
+        app.selected = 3
+        screen.key = "r"
+
+        app._keys(Mock())
+
+        self.assertEqual(app.aps, {})
+        self.assertEqual(app.selected, 0)
+
+    def test_scan_reset_discards_observations_already_in_capture_queue(self):
+        screen = FakeScreen()
+        app = self.make_app(screen)
+        capture = Mock(events=queue.Queue())
+        capture.events.put(("old", "Old AP", -50, 1, 2412))
+        screen.key = "r"
+
+        app._keys(Mock())
+        app._events(capture)
+
+        self.assertEqual(app.aps, {})
+        self.assertTrue(capture.events.empty())
+        self.assertFalse(app.clear_scan_requested)
+
+    def test_network_band_uses_frequency_boundaries(self):
+        self.assertEqual(network_band(2412), 2)
+        self.assertEqual(network_band(5500), 5)
+        self.assertEqual(network_band(5955), 6)
+        self.assertIsNone(network_band(None))
 
     def test_signal_gradient_is_clamped_and_monotonic(self):
         levels = [
