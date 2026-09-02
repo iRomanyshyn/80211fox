@@ -2,6 +2,7 @@ import curses
 import queue
 import signal
 import subprocess
+import threading
 import time
 import unittest
 from unittest.mock import Mock, call, patch
@@ -393,6 +394,58 @@ class ReviewFixTests(unittest.TestCase):
             text for row, text, _ in screen.writes if row == screen.height - 1
         )
         self.assertIn("2:on 5:off 6:on", controls)
+
+    def test_disabled_band_is_skipped_by_channel_hopper(self):
+        screen = FakeScreen()
+        app = self.make_app(screen)
+        screen.key = "5"
+        app._keys(Mock())
+        monitor = Mock()
+        app.stop_event.wait = Mock(
+            side_effect=lambda _timeout: app.stop_event.set()
+        )
+
+        app._hop(monitor, [(5500, 100), (2412, 1)])
+
+        monitor.set_frequency.assert_called_once_with(2412)
+
+    def test_band_toggle_waits_for_in_progress_channel_tune(self):
+        screen = FakeScreen()
+        app = self.make_app(screen)
+        screen.key = "5"
+        key_read = threading.Event()
+        original_get_wch = screen.get_wch
+
+        def get_wch():
+            key_read.set()
+            return original_get_wch()
+
+        screen.get_wch = get_wch
+        app.tune_lock.acquire()
+        toggle = threading.Thread(target=app._keys, args=(Mock(),))
+        try:
+            toggle.start()
+            self.assertTrue(key_read.wait(1))
+            self.assertIn(5, app.enabled_bands)
+        finally:
+            app.tune_lock.release()
+            toggle.join(timeout=1)
+
+        self.assertFalse(toggle.is_alive())
+        self.assertNotIn(5, app.enabled_bands)
+
+    def test_hopper_waits_without_tuning_when_all_bands_are_disabled(self):
+        app = self.make_app()
+        app.enabled_bands.clear()
+        monitor = Mock()
+        app.stop_event.wait = Mock(
+            side_effect=lambda _timeout: app.stop_event.set()
+        )
+
+        app._hop(monitor, [(2412, 1), (5500, 100), (6115, 33)])
+
+        monitor.set_frequency.assert_not_called()
+        app.stop_event.wait.assert_called_once_with(0.1)
 
     def test_scan_reset_key_clears_discovered_networks(self):
         screen = FakeScreen()

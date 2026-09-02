@@ -177,12 +177,22 @@ class Application:
                 self.stop_event.wait(0.1)
                 continue
             if self.hunt is None:
+                scanned_frequency = False
                 for frequency, _ in frequencies:
                     if self.stop_event.is_set() or self.hunt is not None or self.paused:
                         break
+                    band = network_band(frequency)
+                    if band is not None and band not in self.enabled_bands:
+                        continue
+                    scanned_frequency = True
                     try:
                         with self.tune_lock:
-                            if self.hunt is None and not self.paused:
+                            band = network_band(frequency)
+                            if (
+                                self.hunt is None
+                                and not self.paused
+                                and (band is None or band in self.enabled_bands)
+                            ):
                                 monitor.set_frequency(frequency)
                                 self.current_frequency = frequency
                                 self.usable_frequencies.add(frequency)
@@ -191,6 +201,9 @@ class Application:
                         self.usable_frequencies.discard(frequency)
                         self.rejected_frequencies[frequency] = command_error(error)
                     self.stop_event.wait(HOP_DWELL)
+                if not scanned_frequency:
+                    # Avoid a busy loop when every known band is disabled.
+                    self.stop_event.wait(0.1)
             else:
                 target = self.hunt
                 if target is None:
@@ -321,10 +334,14 @@ class Application:
             self.filter_before_edit = self.filter
         elif key in ("2", "5", "6"):
             band = int(key)
-            if band in self.enabled_bands:
-                self.enabled_bands.remove(band)
-            else:
-                self.enabled_bands.add(band)
+            # Serialize band changes with channel tuning. This makes the band
+            # check in the hopper and the subsequent set-frequency command a
+            # single operation from the UI's point of view.
+            with self.tune_lock:
+                if band in self.enabled_bands:
+                    self.enabled_bands.remove(band)
+                else:
+                    self.enabled_bands.add(band)
             self.selected = 0
         elif key in ("r", "R"):
             self.aps.clear()
