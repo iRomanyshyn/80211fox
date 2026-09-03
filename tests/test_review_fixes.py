@@ -32,6 +32,7 @@ from fox80211.tui import (
     LOCK_ATTEMPTS,
     Application,
     TuneStatistics,
+    display_width,
     network_band,
     scan_controls,
     scan_expiry,
@@ -212,6 +213,11 @@ class ReviewFixTests(unittest.TestCase):
         self.assertIn("[Q] quit", controls)
         self.assertLessEqual(len(controls), 79)
 
+    def test_scan_keeps_band_status_when_only_compact_suffix_fits(self):
+        controls = scan_controls("pause", {2, 6}, 72)
+        self.assertIn("2:on 5:off 6:on", controls)
+        self.assertLessEqual(len(controls), 72)
+
     def test_scan_header_fills_width_and_aligns_with_rows(self):
         layout = scan_layout(120)
         header = scan_header(layout)
@@ -236,6 +242,16 @@ class ReviewFixTests(unittest.TestCase):
             start = header.rindex(label) if label == "SSID" else header.index(label)
             self.assertEqual(row[start : start + field_width].strip(), value)
 
+    def test_scan_row_accounts_for_double_width_ssid_characters(self):
+        layout = scan_layout(80)
+        row = scan_row(
+            AccessPoint("00:11:22:33:44:55", "網絡" * 30, -51, 36, 5180),
+            1.0,
+            layout,
+        )
+
+        self.assertEqual(display_width(row), layout.width)
+
     def test_help_explains_dfs_and_band_buttons(self):
         screen = FakeScreen(height=15, width=100)
         app = self.make_app(screen)
@@ -250,6 +266,16 @@ class ReviewFixTests(unittest.TestCase):
         self.assertIn("[2] toggle 2.4 GHz", rendered)
         self.assertIn("[5] toggle 5 GHz", rendered)
         self.assertIn("[6] toggle 6 GHz", rendered)
+
+    def test_ctrl_c_stops_application_while_help_is_open(self):
+        screen = FakeScreen()
+        app = self.make_app(screen)
+        app.help_visible = True
+        screen.key = "\x03"
+
+        app._keys(Mock())
+
+        self.assertFalse(app.running)
 
     def test_space_pauses_scan_and_updates_controls(self):
         screen = FakeScreen()

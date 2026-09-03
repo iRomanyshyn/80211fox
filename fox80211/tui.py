@@ -5,6 +5,7 @@ import queue
 import subprocess
 import threading
 import time
+import unicodedata
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -117,6 +118,32 @@ def scan_header(layout: ScanLayout) -> str:
     return " ".join(parts)[: layout.width].ljust(layout.width)
 
 
+def display_width(text: str) -> int:
+    """Return the terminal-cell width of text without an external dependency."""
+    return sum(
+        0
+        if unicodedata.combining(character)
+        or unicodedata.category(character) in ("Cf", "Cc")
+        else 2
+        if unicodedata.east_asian_width(character) in ("W", "F")
+        else 1
+        for character in text
+    )
+
+
+def fit_cells(text: str, width: int) -> str:
+    """Truncate and pad text to at most ``width`` terminal display cells."""
+    result: list[str] = []
+    used = 0
+    for character in text:
+        character_width = display_width(character)
+        if used + character_width > width:
+            break
+        result.append(character)
+        used += character_width
+    return "".join(result) + " " * (width - used)
+
+
 def scan_row(
     ap: AccessPoint,
     age: float,
@@ -144,7 +171,7 @@ def scan_row(
         parts.append(f"{ap.frequency or '?':>5}")
     if layout.bssid:
         parts.append(f"{ap.bssid:<17.17}")
-    parts.append(f"{ap.ssid:<{layout.ssid_width}.{layout.ssid_width}}")
+    parts.append(fit_cells(ap.ssid, layout.ssid_width))
     if layout.last:
         parts.append(("?" if age >= UNCERTAIN_AFTER else " ") + format_age(age))
     return " ".join(parts)[: layout.width]
@@ -604,7 +631,9 @@ class Application:
                 self.diagnostics_selected += 1
             return True
         if self.help_visible:
-            if key in (27, "\x1b", "h", "H", "?", "q", "Q"):
+            if key in ("\x03", 3):
+                self.running = False
+            elif key in (27, "\x1b", "h", "H", "?", "q", "Q"):
                 self.help_visible = False
             return True
         if key in ("q", "Q", "\x03", 3):
@@ -1147,10 +1176,16 @@ def scan_controls(action: str, enabled_bands: set[int], width: int) -> str:
         f"  {bands}  dim=unseen 1m+",
         f"  Bands {bands}  [H/?] help",
         f"  Bands {bands}",
-        "  [H/?] help",
     ):
         if len(controls) + len(suffix) <= width:
             return controls + suffix
+    compact_bands = f"  {bands}"
+    for shorter_controls in variants[1:]:
+        if len(shorter_controls) + len(compact_bands) <= width:
+            return shorter_controls + compact_bands
+    help_suffix = "  [H/?] help"
+    if len(controls) + len(help_suffix) <= width:
+        return controls + help_suffix
     return controls
 
 
