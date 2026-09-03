@@ -68,11 +68,17 @@ class AccessPoint:
         if self.maximum is None:
             self.maximum = self.rssi
 
-    def update(self, rssi: int, channel: int | None, frequency: int | None) -> None:
+    def update(
+        self,
+        rssi: int,
+        channel: int | None,
+        frequency: int | None,
+        observed_at: float | None = None,
+    ) -> None:
         self.rssi = rssi
         self.channel = channel or self.channel
         self.frequency = frequency or self.frequency
-        self.last_seen = time.monotonic()
+        self.last_seen = time.monotonic() if observed_at is None else observed_at
         self.rssi_history.append((self.last_seen, rssi))
         self._prune_rssi_history(self.last_seen - RSSI_HISTORY_SECONDS)
         self.samples += 1

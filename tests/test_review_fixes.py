@@ -6,6 +6,7 @@ import subprocess
 import threading
 import time
 import unittest
+from collections import deque
 from unittest.mock import Mock, call, patch
 
 from fox80211.capture import (
@@ -37,6 +38,7 @@ from fox80211.tui import (
     scan_controls,
     scan_expiry,
     scan_header,
+    scan_is_uncertain,
     scan_layout,
     scan_row,
     scan_status,
@@ -444,7 +446,66 @@ class ReviewFixTests(unittest.TestCase):
         controls = next(
             text for index, text, _ in screen.writes if index == screen.height - 1
         )
-        self.assertIn("dim=unseen 1m+", controls)
+        self.assertIn("gray=2 sweeps/1m+", controls)
+
+    def test_scan_grays_network_only_after_two_missed_complete_sweeps(self):
+        screen = FakeScreen()
+        app = self.make_app(screen)
+        now = time.monotonic()
+        ap = AccessPoint(
+            "00:11:22:33:44:55",
+            "Office",
+            -50,
+            1,
+            2412,
+            last_seen=now,
+        )
+        app.aps[ap.bssid] = ap
+
+        self.assertFalse(scan_is_uncertain(ap, {2: deque([now + 1])}, 1.0))
+        app.completed_sweep_starts[2].extend((now + 1, now + 2))
+        with patch("fox80211.tui.time.monotonic", return_value=now + 1):
+            app._draw_scan()
+
+        row, attributes = next(
+            (text, attributes)
+            for index, text, attributes in screen.writes
+            if index == 3
+        )
+        self.assertIn("?  1.0s", row)
+        self.assertTrue(attributes & curses.A_DIM)
+
+    def test_queued_observation_keeps_capture_time_across_sweep_boundary(self):
+        app = self.make_app()
+        now = time.monotonic()
+        app.completed_sweep_starts[2].extend((now - 30, now - 20))
+        capture = Mock(events=queue.Queue())
+        capture.events.put(("AA", "Office", -50, 1, 2412, now - 40))
+
+        app._events(capture)
+
+        self.assertEqual(app.aps["AA"].last_seen, now - 40)
+        self.assertTrue(
+            scan_is_uncertain(app.aps["AA"], app.completed_sweep_starts, 1.0)
+        )
+
+    def test_disabled_band_sweeps_do_not_age_hidden_access_points(self):
+        app = self.make_app()
+        app.enabled_bands = {2}
+        monitor = Mock()
+        waits = 0
+
+        def wait(_timeout):
+            nonlocal waits
+            waits += 1
+            if waits == 4:
+                app.stop_event.set()
+
+        app.stop_event.wait = Mock(side_effect=wait)
+        app._hop(monitor, [(2412, 1), (5500, 100)])
+
+        self.assertEqual(len(app.completed_sweep_starts[2]), 2)
+        self.assertEqual(len(app.completed_sweep_starts[5]), 0)
 
     def test_number_keys_toggle_band_filters(self):
         screen = FakeScreen()
@@ -645,6 +706,21 @@ class ReviewFixTests(unittest.TestCase):
 
         self.assertEqual(capture.frames_parsed, 0)
         self.assertEqual(capture.parse_errors, 1)
+        capture.stderr.close()
+
+    @patch("fox80211.capture.time.monotonic", return_value=123.0)
+    def test_capture_event_records_reader_timestamp(self, _monotonic):
+        capture = TsharkCapture("mon0")
+        capture.fields = capture.FIELDS
+        capture.process = Mock(
+            stdout=io.StringIO(
+                '"AA:BB:CC:DD:EE:FF"\t"Office"\t"-50"\t"1"\t"2412"\n'
+            )
+        )
+
+        capture._read()
+
+        self.assertEqual(capture.events.get_nowait()[5], 123.0)
         capture.stderr.close()
 
     def test_scan_status_keeps_timing_on_an_eighty_column_row(self):
