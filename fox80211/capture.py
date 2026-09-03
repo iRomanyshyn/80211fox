@@ -83,10 +83,10 @@ class TsharkCapture:
             if len(row) != len(self.fields) or not row[0]:
                 self.parse_errors += 1
                 continue
-            self.frames_parsed += 1
             try:
                 # Multiple antenna values are comma-separated; strongest is useful for hunting.
                 signals = [int(x) for x in row[2].split(",") if x]
+                self.frames_parsed += 1
                 if not signals:
                     self.frames_without_rssi += 1
                     continue

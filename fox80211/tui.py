@@ -135,7 +135,9 @@ class Application:
         self.lock_attempt = 0
         self.lock_detail: str | None = None
         self.capture_statistics: TsharkCapture | None = None
+        self.capture_totals = [0, 0, 0, 0]
         self.diagnostics = False
+        self.diagnostics_selected = 0
 
     def run(self) -> None:
         frequencies = available_frequencies(self.adapter.phy)
@@ -168,9 +170,11 @@ class Application:
                     if capture.target_bssid != (
                         desired_target.casefold() if desired_target else None
                     ):
-                        capture = self._replace_capture(
+                        replacement = self._replace_capture(
                             capture, monitor.name, desired_target
                         )
+                        self._accumulate_capture(capture)
+                        capture = replacement
                         self.capture_statistics = capture
                     self._draw()
                     time.sleep(0.05)
@@ -193,6 +197,10 @@ class Application:
             raise
         current.stop()
         return replacement
+
+    def _accumulate_capture(self, capture: TsharkCapture) -> None:
+        for index, value in enumerate(capture_counters(capture)):
+            self.capture_totals[index] += value
 
     def _hop(
         self, monitor: MonitorInterface, frequencies: list[tuple[int, int]]
@@ -228,8 +236,9 @@ class Application:
                                 self.usable_frequencies.add(frequency)
                                 self.rejected_frequencies.pop(frequency, None)
                     except Exception as error:
-                        self.usable_frequencies.discard(frequency)
-                        self.rejected_frequencies[frequency] = command_error(error)
+                        with self.tune_lock:
+                            self.usable_frequencies.discard(frequency)
+                            self.rejected_frequencies[frequency] = command_error(error)
                     self.stop_event.wait(HOP_DWELL)
                 if (
                     scanned_frequency
@@ -355,6 +364,10 @@ class Application:
                 self.diagnostics = False
             elif key in ("q", "Q", "\x03", 3):
                 self.running = False
+            elif key in (curses.KEY_UP, "k"):
+                self.diagnostics_selected = max(0, self.diagnostics_selected - 1)
+            elif key in (curses.KEY_DOWN, "j"):
+                self.diagnostics_selected += 1
             return True
         if key in ("q", "Q", "\x03", 3):
             self.running = False
@@ -382,6 +395,7 @@ class Application:
             self.filter_before_edit = self.filter
         elif key in ("d", "D"):
             self.diagnostics = True
+            self.diagnostics_selected = 0
         elif key in ("2", "5", "6"):
             band = int(key)
             # Serialize band changes with channel tuning. This makes the band
@@ -494,16 +508,21 @@ class Application:
             max(0, self.screen.getmaxyx()[1] - len(prefix) - 1),
             field_attr,
         )
-        total = len(self.channel_by_frequency)
-        current = self.channel_by_frequency.get(self.current_frequency or 0, "?")
-        tune = self.tune_statistics.latest
-        sweep = self.tune_statistics.last_sweep
-        timing = f"   tune {tune * 1000:.0f} ms" if tune is not None else ""
-        timing += f"   sweep {sweep:.1f} s" if sweep is not None else ""
-        self.screen.addstr(
+        width = self.screen.getmaxyx()[1]
+        self.screen.addnstr(
             1,
             0,
-            f"Channels: {total} available / {len(self.usable_frequencies)} usable / {len(self.rejected_frequencies)} rejected   Current: {current} ({self.current_frequency or '?'} MHz){timing}",
+            scan_status(
+                len(self.channel_by_frequency),
+                len(self.usable_frequencies),
+                len(self.rejected_frequencies),
+                self.channel_by_frequency.get(self.current_frequency or 0, "?"),
+                self.current_frequency,
+                self.tune_statistics.latest,
+                self.tune_statistics.last_sweep,
+                width - 1,
+            ),
+            width - 1,
         )
         self.screen.addstr(
             2,
@@ -546,6 +565,15 @@ class Application:
     def _draw_diagnostics(self) -> None:
         height, width = self.screen.getmaxyx()
         self.screen.addnstr(0, 0, "DIAGNOSTICS", width - 1, curses.A_BOLD)
+        if height < 7:
+            if height > 2:
+                self.screen.addnstr(
+                    1, 0, "Resize to at least 7 rows", width - 1, curses.A_BOLD
+                )
+            self.screen.addnstr(
+                height - 1, 0, "[D/Esc] scan   [Q] quit", width - 1, curses.A_BOLD
+            )
+            return
         stats = self.tune_statistics
         tune = "not measured"
         if stats.samples and stats.ewma is not None and stats.latest is not None:
@@ -562,25 +590,42 @@ class Application:
         self.screen.addnstr(2, 0, f"Last complete sweep: {sweep}", width - 1)
         capture = self.capture_statistics
         if capture is not None:
+            counters = tuple(
+                total + current
+                for total, current in zip(
+                    self.capture_totals, capture_counters(capture), strict=True
+                )
+            )
             capture_line = (
-                f"Frames: parsed {capture.frames_parsed}   with RSSI "
-                f"{capture.frames_with_rssi}   without RSSI "
-                f"{capture.frames_without_rssi}   parse errors {capture.parse_errors}"
+                f"Frames: parsed {counters[0]}   with RSSI {counters[1]}   "
+                f"without RSSI {counters[2]}   parse errors {counters[3]}"
             )
             self.screen.addnstr(3, 0, capture_line, width - 1)
         self.screen.addnstr(5, 0, "Rejected frequencies", width - 1, curses.A_BOLD)
         rows = max(0, height - 7)
-        for row, (frequency, reason) in enumerate(
-            sorted(self.rejected_frequencies.items())[:rows], 6
-        ):
+        with self.tune_lock:
+            rejected = sorted(self.rejected_frequencies.items())
+        self.diagnostics_selected = min(
+            self.diagnostics_selected, max(0, len(rejected) - 1)
+        )
+        offset = min(
+            max(0, self.diagnostics_selected - rows + 1),
+            max(0, len(rejected) - rows),
+        )
+        for row, (frequency, reason) in enumerate(rejected[offset : offset + rows], 6):
             channel = self.channel_by_frequency.get(frequency, "?")
+            attr = (
+                curses.A_REVERSE
+                if offset + row - 6 == self.diagnostics_selected
+                else 0
+            )
             self.screen.addnstr(
-                row, 0, f"{frequency} MHz / ch {channel}: {reason}", width - 1
+                row, 0, f"{frequency} MHz / ch {channel}: {reason}", width - 1, attr
             )
         self.screen.addnstr(
             height - 1,
             0,
-            "[D/Esc] scan   [Q] quit",
+            "[Up/Down] rejected   [D/Esc] scan   [Q] quit",
             width - 1,
             curses.A_BOLD,
         )
@@ -685,6 +730,41 @@ def scan_expiry(frequency_count: int, last_sweep: float | None = None) -> float:
     measured = last_sweep * 1.2 if last_sweep is not None else 0.0
     estimated = (HOP_DWELL + HOP_TUNE_BUDGET) * (frequency_count + 1)
     return max(EXPIRE_AFTER, measured, estimated)
+
+
+def capture_counters(capture: TsharkCapture) -> tuple[int, int, int, int]:
+    return (
+        capture.frames_parsed,
+        capture.frames_with_rssi,
+        capture.frames_without_rssi,
+        capture.parse_errors,
+    )
+
+
+def scan_status(
+    total: int,
+    usable: int,
+    rejected: int,
+    channel: int | str,
+    frequency: int | None,
+    tune: float | None,
+    sweep: float | None,
+    width: int,
+) -> str:
+    """Return the most informative scan status which fits one terminal row."""
+    timing = f" tune {tune * 1000:.0f}ms" if tune is not None else ""
+    timing += f" sweep {sweep:.1f}s" if sweep is not None else ""
+    frequency_text = frequency or "?"
+    variants = (
+        f"Channels: {total} available / {usable} usable / {rejected} rejected   Current: {channel} ({frequency_text} MHz){timing}",
+        f"Ch {total} avail/{usable} ok/{rejected} reject  Current {channel} ({frequency_text}MHz){timing}",
+        f"Ch {usable}/{total} reject {rejected}  {channel} ({frequency_text}MHz){timing}",
+        f"Ch {channel} {frequency_text}MHz{timing}",
+    )
+    return next(
+        (variant for variant in variants if len(variant) <= width),
+        variants[-1][: max(0, width)],
+    )
 
 
 def smoothed_rssi(ap: AccessPoint) -> float:

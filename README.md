@@ -86,7 +86,8 @@ In SCAN, press `2`, `5`, or `6` to toggle networks in the corresponding Wi-Fi
 band; the control bar shows which bands are enabled. Networks whose frequency
 has not yet been identified remain visible. Press `D` for measured channel-tune
 and sweep timing, capture/RSSI counters, and per-frequency rejection reasons;
-press `D` or Escape to return. Press `R` to clear all accumulated
+use Up/Down to inspect every rejected frequency, then press `D` or Escape to
+return. Press `R` to clear all accumulated
 networks (live networks may be discovered again immediately). Press `F` to open
 the highlighted filter field, then type to filter
 dynamically by partial case-insensitive SSID or BSSID; punctuation and case in

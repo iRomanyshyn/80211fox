@@ -35,6 +35,7 @@ from fox80211.tui import (
     network_band,
     scan_controls,
     scan_expiry,
+    scan_status,
     signal_level,
 )
 
@@ -562,6 +563,77 @@ class ReviewFixTests(unittest.TestCase):
         self.assertEqual(capture.frames_without_rssi, 1)
         self.assertTrue(capture.events.empty())
         capture.stderr.close()
+
+    def test_malformed_rssi_is_only_a_parse_error(self):
+        capture = TsharkCapture("mon0")
+        capture.fields = capture.FIELDS
+        capture.process = Mock(
+            stdout=io.StringIO(
+                '"AA:BB:CC:DD:EE:FF"\t"Office"\t"invalid"\t"1"\t"2412"\n'
+            )
+        )
+
+        capture._read()
+
+        self.assertEqual(capture.frames_parsed, 0)
+        self.assertEqual(capture.parse_errors, 1)
+        capture.stderr.close()
+
+    def test_scan_status_keeps_timing_on_an_eighty_column_row(self):
+        status = scan_status(50, 47, 3, 124, 5620, 0.028, 19.3, 79)
+        self.assertLessEqual(len(status), 79)
+        self.assertIn("tune 28ms", status)
+        self.assertIn("sweep 19.3s", status)
+
+    def test_short_diagnostics_layout_stays_inside_terminal(self):
+        screen = FakeScreen(height=4, width=40)
+        app = self.make_app(screen)
+
+        app._draw_diagnostics()
+
+        self.assertTrue(all(row < screen.height for row, _, _ in screen.writes))
+        self.assertIn(
+            "Resize to at least 7 rows",
+            " ".join(text for _, text, _ in screen.writes),
+        )
+
+    def test_diagnostics_scrolls_to_all_rejected_frequencies(self):
+        screen = FakeScreen(height=9)
+        app = self.make_app(screen)
+        for index in range(8):
+            app.rejected_frequencies[5000 + index * 5] = f"failure {index}"
+        app.diagnostics_selected = 7
+
+        app._draw_diagnostics()
+
+        rendered = " ".join(text for _, text, _ in screen.writes)
+        self.assertIn("failure 7", rendered)
+        self.assertNotIn("failure 0", rendered)
+
+    def test_capture_counters_survive_capture_replacement(self):
+        app = self.make_app()
+        previous = Mock(
+            frames_parsed=10,
+            frames_with_rssi=8,
+            frames_without_rssi=1,
+            parse_errors=1,
+        )
+        current = Mock(
+            frames_parsed=4,
+            frames_with_rssi=3,
+            frames_without_rssi=1,
+            parse_errors=0,
+        )
+        app._accumulate_capture(previous)
+        app.capture_statistics = current
+
+        app._draw_diagnostics()
+
+        rendered = " ".join(text for _, text, _ in app.screen.writes)
+        self.assertIn("parsed 14", rendered)
+        self.assertIn("with RSSI 11", rendered)
+        self.assertIn("without RSSI 2", rendered)
+        self.assertIn("parse errors 1", rendered)
 
     def test_failed_frequency_is_removed_from_usable_set(self):
         app = self.make_app()
