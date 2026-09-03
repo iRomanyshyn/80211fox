@@ -150,6 +150,7 @@ def scan_row(
     layout: ScanLayout,
     dfs: bool = False,
     dfs_state: str | None = None,
+    uncertain: bool | None = None,
 ) -> str:
     event = ap.event_label
     if ap.event_target is not None and event in ("MOVE", "CSA"):
@@ -173,7 +174,8 @@ def scan_row(
         parts.append(f"{ap.bssid:<17.17}")
     parts.append(fit_cells(ap.ssid, layout.ssid_width))
     if layout.last:
-        parts.append(("?" if age >= UNCERTAIN_AFTER else " ") + format_age(age))
+        uncertain = age >= UNCERTAIN_AFTER if uncertain is None else uncertain
+        parts.append(("?" if uncertain else " ") + format_age(age))
     return " ".join(parts)[: layout.width]
 
 
@@ -258,6 +260,7 @@ class Application:
         self.hunt_notice: HuntNotice | None = None
         self.deferred_dfs_events: deque[DfsEvent | ChannelSwitch] = deque(maxlen=256)
         self.csa_available = False
+        self.completed_sweeps = 0
 
     def run(self) -> None:
         channels = available_channels(self.adapter.phy)
@@ -507,6 +510,7 @@ class Application:
                     and not self.paused
                 ):
                     self.tune_statistics.last_sweep = time.monotonic() - sweep_started
+                    self.completed_sweeps += 1
                     self.expire_after = scan_expiry(
                         len(frequencies), self.tune_statistics.last_sweep
                     )
@@ -577,6 +581,7 @@ class Application:
                 if ssid != MISSING_SSID or ap.ssid == MISSING_SSID:
                     ap.ssid = ssid
                 ap.update(rssi, channel, frequency)
+                ap.last_seen_sweep = self.completed_sweeps + 1
             else:
                 self.aps[bssid] = AccessPoint(
                     bssid,
@@ -587,6 +592,7 @@ class Application:
                     average=float(rssi),
                     minimum=rssi,
                     maximum=rssi,
+                    last_seen_sweep=self.completed_sweeps + 1,
                 )
         if apply:
             now = time.monotonic()
@@ -814,6 +820,7 @@ class Application:
             index = offset + row
             now = self.paused_at if self.paused_at is not None else time.monotonic()
             age = now - ap.last_seen
+            uncertain = scan_is_uncertain(ap, self.completed_sweeps, age)
             rssi = round(smoothed_rssi(ap))
             metadata = self.channels.get(ap.frequency or 0)
             line = scan_row(
@@ -822,11 +829,12 @@ class Application:
                 layout,
                 bool(metadata and metadata.radar),
                 metadata.dfs_state if metadata else None,
+                uncertain,
             )
             # Stale observations must be visually distinct from live signal
             # strength, so do not retain a signal-gradient colour for them.
-            attr = curses.A_DIM if age >= UNCERTAIN_AFTER else scan_signal_attr(rssi)
-            if age < UNCERTAIN_AFTER:
+            attr = curses.A_DIM if uncertain else scan_signal_attr(rssi)
+            if not uncertain:
                 state_label = (
                     "NOP"
                     if metadata and metadata.dfs_state == "UNAVAILABLE"
@@ -1105,6 +1113,12 @@ def scan_expiry(frequency_count: int, last_sweep: float | None = None) -> float:
     return max(EXPIRE_AFTER, measured, estimated)
 
 
+def scan_is_uncertain(ap: AccessPoint, completed_sweeps: int, age: float) -> bool:
+    """Return whether an AP should be greyed as no longer reliably present."""
+    missed_sweeps = max(0, completed_sweeps - ap.last_seen_sweep)
+    return missed_sweeps >= 2 or age >= UNCERTAIN_AFTER
+
+
 def capture_counters(capture: TsharkCapture) -> tuple[int, int, int, int]:
     return (
         capture.frames_parsed,
@@ -1171,9 +1185,9 @@ def scan_controls(action: str, enabled_bands: set[int], width: int) -> str:
         f"{band}:{'on' if band in enabled_bands else 'off'}" for band in BANDS
     )
     for suffix in (
-        f"  Bands {bands}  dim=unseen 1m+  [H/?] help  [D] diag",
-        f"  {bands}  dim=unseen 1m+  [H]help",
-        f"  {bands}  dim=unseen 1m+",
+        f"  Bands {bands}  gray=missed 2 sweeps/1m+  [H/?] help  [D] diag",
+        f"  {bands}  gray=2 sweeps/1m+  [H]help",
+        f"  {bands}  gray=2 sweeps/1m+",
         f"  Bands {bands}  [H/?] help",
         f"  Bands {bands}",
     ):

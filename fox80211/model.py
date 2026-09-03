@@ -57,6 +57,8 @@ class AccessPoint:
     event_label: str = "-"
     event_target: int | None = None
     event_seen: float | None = None
+    # The active scan sweep in which this AP was most recently observed.
+    last_seen_sweep: int = 0
 
     def __post_init__(self) -> None:
         if not self.rssi_history:

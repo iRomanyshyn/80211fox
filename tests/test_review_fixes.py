@@ -37,6 +37,7 @@ from fox80211.tui import (
     scan_controls,
     scan_expiry,
     scan_header,
+    scan_is_uncertain,
     scan_layout,
     scan_row,
     scan_status,
@@ -444,7 +445,47 @@ class ReviewFixTests(unittest.TestCase):
         controls = next(
             text for index, text, _ in screen.writes if index == screen.height - 1
         )
-        self.assertIn("dim=unseen 1m+", controls)
+        self.assertIn("gray=2 sweeps/1m+", controls)
+
+    def test_scan_grays_network_only_after_two_missed_complete_sweeps(self):
+        screen = FakeScreen()
+        app = self.make_app(screen)
+        now = time.monotonic()
+        ap = AccessPoint(
+            "00:11:22:33:44:55",
+            "Office",
+            -50,
+            1,
+            2412,
+            last_seen=now,
+            last_seen_sweep=1,
+        )
+        app.aps[ap.bssid] = ap
+
+        self.assertFalse(scan_is_uncertain(ap, 2, 1.0))
+        app.completed_sweeps = 3
+        with patch("fox80211.tui.time.monotonic", return_value=now + 1):
+            app._draw_scan()
+
+        row, attributes = next(
+            (text, attributes)
+            for index, text, attributes in screen.writes
+            if index == 3
+        )
+        self.assertIn("?  1.0s", row)
+        self.assertTrue(attributes & curses.A_DIM)
+
+    def test_scan_observation_targets_current_in_progress_sweep(self):
+        app = self.make_app()
+        app.completed_sweeps = 4
+        capture = Mock(events=queue.Queue())
+        capture.events.put(("AA", "Office", -50, 1, 2412))
+
+        app._events(capture)
+
+        self.assertEqual(app.aps["AA"].last_seen_sweep, 5)
+        self.assertFalse(scan_is_uncertain(app.aps["AA"], 6, 1.0))
+        self.assertTrue(scan_is_uncertain(app.aps["AA"], 7, 1.0))
 
     def test_number_keys_toggle_band_filters(self):
         screen = FakeScreen()
