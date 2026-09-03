@@ -268,6 +268,23 @@ class ReviewFixTests(unittest.TestCase):
         self.assertIn("[2] toggle 2.4 GHz", rendered)
         self.assertIn("[5] toggle 5 GHz", rendered)
         self.assertIn("[6] toggle 6 GHz", rendered)
+        self.assertIn("not seen during 2 complete sweeps of its known band", rendered)
+        self.assertIn("Unknown-band APs use 1 minute", rendered)
+
+    def test_short_help_prioritizes_key_references_over_gray_details(self):
+        screen = FakeScreen(height=12, width=100)
+        app = self.make_app(screen)
+        app.help_visible = True
+
+        app._draw_help()
+
+        rendered = " ".join(text for _, text, _ in screen.writes)
+        self.assertIn("[2] toggle 2.4 GHz", rendered)
+        self.assertIn("[6] toggle 6 GHz", rendered)
+        self.assertIn("[F] filter", rendered)
+        self.assertIn("[Enter] hunt", rendered)
+        self.assertIn("[D] diagnostics", rendered)
+        self.assertNotIn("Unknown-band APs use 1 minute", rendered)
 
     def test_ctrl_c_stops_application_while_help_is_open(self):
         screen = FakeScreen()
@@ -420,7 +437,7 @@ class ReviewFixTests(unittest.TestCase):
         self.assertIn("remembered", app.aps)
         self.assertNotIn("dead", app.aps)
 
-    def test_scan_marks_network_not_seen_for_a_minute(self):
+    def test_scan_marks_unknown_band_network_not_seen_for_a_minute(self):
         screen = FakeScreen()
         app = self.make_app(screen)
         now = time.monotonic()
@@ -428,8 +445,8 @@ class ReviewFixTests(unittest.TestCase):
             "00:11:22:33:44:55",
             "Office",
             -50,
-            100,
-            5500,
+            0,
+            None,
             last_seen=now - 61,
         )
 
@@ -446,7 +463,15 @@ class ReviewFixTests(unittest.TestCase):
         controls = next(
             text for index, text, _ in screen.writes if index == screen.height - 1
         )
-        self.assertIn("gray=2 sweeps/1m+", controls)
+        self.assertIn("gray=2 sweeps", controls)
+
+    def test_scan_does_not_gray_known_band_after_a_minute_before_two_sweeps(self):
+        now = time.monotonic()
+        ap = AccessPoint(
+            "00:11:22:33:44:55", "Office", -50, 100, 5500, last_seen=now - 90
+        )
+
+        self.assertFalse(scan_is_uncertain(ap, {5: deque([now - 45])}, 90.0))
 
     def test_scan_grays_network_only_after_two_missed_complete_sweeps(self):
         screen = FakeScreen()
