@@ -42,7 +42,9 @@ in `system.py`.
   added later to produce `124+` only when unambiguous.
 - Radiotap may contain one signal value per antenna. TShark can emit these as a
   list; 80211fox uses the strongest value, then applies an EWMA for the bar and
-  beep cadence. The raw current value remains visible.
+  beep cadence. The raw current value remains visible. RSSI is suitable for
+  relative proximity tracking with the same adapter; absolute readings should
+  not be compared between different adapters or driver stacks.
 - The selected PHY is dedicated to hunting. Its original interface is made
   unmanaged and down before a separate monitor VIF is attempted, preventing
   NetworkManager background scans from fighting channel hopping on the same
@@ -82,7 +84,9 @@ settings may suppress or render visually); `--sound off` disables sound.
 
 In SCAN, press `2`, `5`, or `6` to toggle networks in the corresponding Wi-Fi
 band; the control bar shows which bands are enabled. Networks whose frequency
-has not yet been identified remain visible. Press `R` to clear all accumulated
+has not yet been identified remain visible. Press `D` for measured channel-tune
+and sweep timing, capture/RSSI counters, and per-frequency rejection reasons;
+press `D` or Escape to return. Press `R` to clear all accumulated
 networks (live networks may be discovered again immediately). Press `F` to open
 the highlighted filter field, then type to filter
 dynamically by partial case-insensitive SSID or BSSID; punctuation and case in
@@ -98,7 +102,10 @@ minute without a frame, and removes it after thirty minutes. Its text follows
 the smoothed RSSI through a signal color gradient (with a simpler fallback on limited terminals),
 while the LAST column makes observation age explicit. Its status reports
 usable/rejected tunes; a failed HUNT lock is reported in SCAN rather than
-terminating the program. HUNT stretches its signal bar to the available
+terminating the program. It also reports the latest measured tune latency and
+the duration of the last complete sweep, so slow driver/firmware channel
+switches are visible rather than hidden in the dwell period. Scan retention is
+automatically enlarged when a measured sweep requires it. HUNT stretches its signal bar to the available
 terminal width.
 
 Cleanup is context-managed. Normal exit, Ctrl-C, closing the terminal (SIGHUP),

@@ -6,6 +6,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from .capture import TsharkCapture
 from .model import AccessPoint, Adapter
@@ -16,7 +17,9 @@ UNCERTAIN_AFTER = 60.0
 BANDS = (2, 5, 6)
 EXPIRE_AFTER = 30.0 * 60.0
 LOST_AFTER = 2.0
-FIVE_GHZ_LOST_AFTER = 5.0
+HIGH_BAND_LOST_AFTER = 5.0
+# Compatibility for callers which imported the old, overly narrow name.
+FIVE_GHZ_LOST_AFTER = HIGH_BAND_LOST_AFTER
 HOP_DWELL = 0.35
 HOP_TUNE_BUDGET = 0.1
 LOCK_RETRY_DELAY = 0.1
@@ -44,6 +47,21 @@ SCAN_GRADIENT_COLORS = (
 SCAN_GRADIENT_PAIR_START = 16
 scan_gradient_pairs: tuple[int, ...] = ()
 color_pairs_configured = False
+
+
+@dataclass
+class TuneStatistics:
+    """Runtime channel-switch measurements, in seconds."""
+
+    latest: float | None = None
+    ewma: float | None = None
+    samples: int = 0
+    last_sweep: float | None = None
+
+    def record(self, elapsed: float) -> None:
+        self.latest = elapsed
+        self.ewma = elapsed if self.ewma is None else 0.25 * elapsed + 0.75 * self.ewma
+        self.samples += 1
 
 
 def select_adapter(screen: curses.window, adapters: list[Adapter]) -> Adapter:
@@ -113,6 +131,11 @@ class Application:
         self.tune_error: str | None = None
         self.channel_by_frequency: dict[int, int] = {}
         self.expire_after = EXPIRE_AFTER
+        self.tune_statistics = TuneStatistics()
+        self.lock_attempt = 0
+        self.lock_detail: str | None = None
+        self.capture_statistics: TsharkCapture | None = None
+        self.diagnostics = False
 
     def run(self) -> None:
         frequencies = available_frequencies(self.adapter.phy)
@@ -125,6 +148,7 @@ class Application:
         with MonitorInterface(self.adapter) as monitor:
             capture = TsharkCapture(monitor.name)
             capture.start()
+            self.capture_statistics = capture
             hopper = threading.Thread(
                 target=self._hop,
                 args=(monitor, frequencies),
@@ -147,6 +171,7 @@ class Application:
                         capture = self._replace_capture(
                             capture, monitor.name, desired_target
                         )
+                        self.capture_statistics = capture
                     self._draw()
                     time.sleep(0.05)
             finally:
@@ -178,6 +203,7 @@ class Application:
                 continue
             if self.hunt is None:
                 scanned_frequency = False
+                sweep_started = time.monotonic()
                 for frequency, _ in frequencies:
                     if self.stop_event.is_set() or self.hunt is not None or self.paused:
                         break
@@ -193,7 +219,11 @@ class Application:
                                 and not self.paused
                                 and (band is None or band in self.enabled_bands)
                             ):
+                                tune_started = time.monotonic()
                                 monitor.set_frequency(frequency)
+                                self.tune_statistics.record(
+                                    time.monotonic() - tune_started
+                                )
                                 self.current_frequency = frequency
                                 self.usable_frequencies.add(frequency)
                                 self.rejected_frequencies.pop(frequency, None)
@@ -201,6 +231,16 @@ class Application:
                         self.usable_frequencies.discard(frequency)
                         self.rejected_frequencies[frequency] = command_error(error)
                     self.stop_event.wait(HOP_DWELL)
+                if (
+                    scanned_frequency
+                    and not self.stop_event.is_set()
+                    and self.hunt is None
+                    and not self.paused
+                ):
+                    self.tune_statistics.last_sweep = time.monotonic() - sweep_started
+                    self.expire_after = scan_expiry(
+                        len(frequencies), self.tune_statistics.last_sweep
+                    )
                 if not scanned_frequency:
                     # Avoid a busy loop when every known band is disabled.
                     self.stop_event.wait(0.1)
@@ -310,12 +350,20 @@ class Application:
                 self.filter += key
                 self.selected = 0
             return True
+        if self.diagnostics:
+            if key in (27, "\x1b", "d", "D"):
+                self.diagnostics = False
+            elif key in ("q", "Q", "\x03", 3):
+                self.running = False
+            return True
         if key in ("q", "Q", "\x03", 3):
             self.running = False
         elif self.hunt:
             if key in (27, "\x1b"):
                 self.hunt = None
                 self.locking_hunt = False
+                self.lock_attempt = 0
+                self.lock_detail = None
             elif key in ("b", "B"):
                 self.beep = not self.beep
             elif key in ("r", "R"):
@@ -332,6 +380,8 @@ class Application:
         elif key in ("f", "F"):
             self.filter_editing = True
             self.filter_before_edit = self.filter
+        elif key in ("d", "D"):
+            self.diagnostics = True
         elif key in ("2", "5", "6"):
             band = int(key)
             # Serialize band changes with channel tuning. This makes the band
@@ -372,6 +422,8 @@ class Application:
                     # tune_lock and verifies which frequency the radio is
                     # actually using.
                     self.locking_hunt = True
+                    self.lock_attempt = 0
+                    self.lock_detail = None
         return True
 
     def _lock_frequency(
@@ -382,12 +434,15 @@ class Application:
     ) -> bool:
         """Tune for hunt mode, retrying the driver's transient busy response."""
         for attempt in range(LOCK_ATTEMPTS):
+            self.lock_attempt = attempt + 1
+            self.lock_detail = None
             if cancelled is not None and cancelled():
                 return False
             try:
                 monitor.set_frequency(frequency)
                 return True
             except subprocess.CalledProcessError as error:
+                self.lock_detail = command_error(error)
                 if not frequency_is_busy(error) or attempt == LOCK_ATTEMPTS - 1:
                     raise
                 self.stop_event.wait(LOCK_RETRY_DELAY)
@@ -416,7 +471,9 @@ class Application:
             )
             self.screen.refresh()
             return
-        if self.hunt:
+        if self.diagnostics:
+            self._draw_diagnostics()
+        elif self.hunt:
             self._draw_hunt(self.hunt)
         else:
             self._draw_scan()
@@ -439,10 +496,14 @@ class Application:
         )
         total = len(self.channel_by_frequency)
         current = self.channel_by_frequency.get(self.current_frequency or 0, "?")
+        tune = self.tune_statistics.latest
+        sweep = self.tune_statistics.last_sweep
+        timing = f"   tune {tune * 1000:.0f} ms" if tune is not None else ""
+        timing += f"   sweep {sweep:.1f} s" if sweep is not None else ""
         self.screen.addstr(
             1,
             0,
-            f"Channels: {total} available / {len(self.usable_frequencies)} usable / {len(self.rejected_frequencies)} rejected   Current: {current} ({self.current_frequency or '?'} MHz)",
+            f"Channels: {total} available / {len(self.usable_frequencies)} usable / {len(self.rejected_frequencies)} rejected   Current: {current} ({self.current_frequency or '?'} MHz){timing}",
         )
         self.screen.addstr(
             2,
@@ -482,6 +543,48 @@ class Application:
             curses.A_BOLD,
         )
 
+    def _draw_diagnostics(self) -> None:
+        height, width = self.screen.getmaxyx()
+        self.screen.addnstr(0, 0, "DIAGNOSTICS", width - 1, curses.A_BOLD)
+        stats = self.tune_statistics
+        tune = "not measured"
+        if stats.samples and stats.ewma is not None and stats.latest is not None:
+            tune = (
+                f"latest {stats.latest * 1000:.1f} ms   "
+                f"EWMA {stats.ewma * 1000:.1f} ms   samples {stats.samples}"
+            )
+        self.screen.addnstr(1, 0, f"Tune: {tune}", width - 1)
+        sweep = (
+            f"{stats.last_sweep:.2f} s"
+            if stats.last_sweep is not None
+            else "not measured"
+        )
+        self.screen.addnstr(2, 0, f"Last complete sweep: {sweep}", width - 1)
+        capture = self.capture_statistics
+        if capture is not None:
+            capture_line = (
+                f"Frames: parsed {capture.frames_parsed}   with RSSI "
+                f"{capture.frames_with_rssi}   without RSSI "
+                f"{capture.frames_without_rssi}   parse errors {capture.parse_errors}"
+            )
+            self.screen.addnstr(3, 0, capture_line, width - 1)
+        self.screen.addnstr(5, 0, "Rejected frequencies", width - 1, curses.A_BOLD)
+        rows = max(0, height - 7)
+        for row, (frequency, reason) in enumerate(
+            sorted(self.rejected_frequencies.items())[:rows], 6
+        ):
+            channel = self.channel_by_frequency.get(frequency, "?")
+            self.screen.addnstr(
+                row, 0, f"{frequency} MHz / ch {channel}: {reason}", width - 1
+            )
+        self.screen.addnstr(
+            height - 1,
+            0,
+            "[D/Esc] scan   [Q] quit",
+            width - 1,
+            curses.A_BOLD,
+        )
+
     def _draw_hunt(self, ap: AccessPoint) -> None:
         height, terminal_width = self.screen.getmaxyx()
         if height < 15 or terminal_width < 40:
@@ -493,6 +596,16 @@ class Application:
             self.screen.addstr(
                 6, max(0, (terminal_width - len(message)) // 2), message, curses.A_BOLD
             )
+            if self.lock_attempt:
+                detail = f"retry {self.lock_attempt}/{LOCK_ATTEMPTS}"
+                if self.lock_detail:
+                    detail += f": {self.lock_detail}"
+                self.screen.addnstr(
+                    8,
+                    max(0, (terminal_width - len(detail)) // 2),
+                    detail,
+                    terminal_width - 1,
+                )
             self._draw_hunt_controls(terminal_width)
             return
         smooth = ap.average if ap.average is not None else ap.rssi
@@ -565,11 +678,13 @@ def frequency_is_busy(error: subprocess.CalledProcessError) -> bool:
     return "device or resource busy" in detail or "(-16)" in detail
 
 
-def scan_expiry(frequency_count: int) -> float:
+def scan_expiry(frequency_count: int, last_sweep: float | None = None) -> float:
     # Each hop includes both the dwell and an external `iw` tuning command.
     # Reserve a per-channel tuning/scheduling budget as well as one complete
     # extra hop so observations remain visible until their channel is revisited.
-    return max(EXPIRE_AFTER, (HOP_DWELL + HOP_TUNE_BUDGET) * (frequency_count + 1))
+    measured = last_sweep * 1.2 if last_sweep is not None else 0.0
+    estimated = (HOP_DWELL + HOP_TUNE_BUDGET) * (frequency_count + 1)
+    return max(EXPIRE_AFTER, measured, estimated)
 
 
 def smoothed_rssi(ap: AccessPoint) -> float:
@@ -602,7 +717,11 @@ def scan_controls(action: str, enabled_bands: set[int], width: int) -> str:
     bands = " ".join(
         f"{band}:{'on' if band in enabled_bands else 'off'}" for band in BANDS
     )
-    for suffix in (f"  {bands}  dim=unseen 1m+", f"  {bands}"):
+    for suffix in (
+        f"  {bands}  dim=unseen 1m+  [D] diag",
+        f"  {bands}  dim=unseen 1m+",
+        f"  {bands}",
+    ):
         if len(controls) + len(suffix) <= width:
             return controls + suffix
     return controls
@@ -631,7 +750,7 @@ def scan_signal_attr(rssi: float) -> int:
 
 def hunt_lost_after(frequency: int | None) -> float:
     return (
-        FIVE_GHZ_LOST_AFTER
+        HIGH_BAND_LOST_AFTER
         if frequency is not None and frequency >= 5000
         else LOST_AFTER
     )

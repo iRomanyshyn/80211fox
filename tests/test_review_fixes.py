@@ -1,4 +1,5 @@
 import curses
+import io
 import queue
 import signal
 import subprocess
@@ -30,6 +31,7 @@ from fox80211.tui import (
     KEYS_PER_TICK,
     LOCK_ATTEMPTS,
     Application,
+    TuneStatistics,
     network_band,
     scan_controls,
     scan_expiry,
@@ -510,6 +512,56 @@ class ReviewFixTests(unittest.TestCase):
 
     def test_expiry_covers_complete_channel_sweep(self):
         self.assertGreaterEqual(scan_expiry(100), (HOP_DWELL + HOP_TUNE_BUDGET) * 100)
+
+    def test_expiry_adapts_to_measured_sweep(self):
+        self.assertEqual(scan_expiry(1, EXPIRE_AFTER), EXPIRE_AFTER * 1.2)
+
+    def test_tune_statistics_tracks_latest_and_ewma(self):
+        statistics = TuneStatistics()
+        statistics.record(0.020)
+        statistics.record(0.100)
+        self.assertEqual(statistics.latest, 0.100)
+        self.assertAlmostEqual(statistics.ewma, 0.040)
+        self.assertEqual(statistics.samples, 2)
+
+    def test_diagnostics_shows_timing_capture_and_rejections(self):
+        screen = FakeScreen()
+        app = self.make_app(screen)
+        app.tune_statistics.record(0.028)
+        app.tune_statistics.last_sweep = 19.3
+        app.channel_by_frequency[5620] = 124
+        app.rejected_frequencies[5620] = "Operation not permitted (-1)"
+        app.capture_statistics = Mock(
+            frames_parsed=100,
+            frames_with_rssi=97,
+            frames_without_rssi=2,
+            parse_errors=1,
+        )
+
+        app._draw_diagnostics()
+
+        rendered = " ".join(text for _, text, _ in screen.writes)
+        self.assertIn("latest 28.0 ms", rendered)
+        self.assertIn("Last complete sweep: 19.30 s", rendered)
+        self.assertIn("without RSSI 2", rendered)
+        self.assertIn("5620 MHz / ch 124: Operation not permitted (-1)", rendered)
+
+    def test_capture_counts_frames_without_rssi(self):
+        capture = TsharkCapture("mon0")
+        capture.fields = capture.FIELDS
+        capture.process = Mock(
+            stdout=io.StringIO(
+                '"AA:BB:CC:DD:EE:FF"\t"Office"\t""\t"1"\t"2412"\n'
+            )
+        )
+
+        capture._read()
+
+        self.assertEqual(capture.frames_parsed, 1)
+        self.assertEqual(capture.frames_with_rssi, 0)
+        self.assertEqual(capture.frames_without_rssi, 1)
+        self.assertTrue(capture.events.empty())
+        capture.stderr.close()
 
     def test_failed_frequency_is_removed_from_usable_set(self):
         app = self.make_app()

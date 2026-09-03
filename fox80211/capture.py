@@ -38,6 +38,10 @@ class TsharkCapture:
         self.fields = self.FIELDS
         self.ssid_is_bytes = False
         self.last_target_event = 0.0
+        self.frames_parsed = 0
+        self.frames_with_rssi = 0
+        self.frames_without_rssi = 0
+        self.parse_errors = 0
 
     def start(self) -> None:
         supported = _tshark_fields()
@@ -77,10 +81,15 @@ class TsharkCapture:
         assert self.process and self.process.stdout
         for row in csv.reader(self.process.stdout, delimiter="\t"):
             if len(row) != len(self.fields) or not row[0]:
+                self.parse_errors += 1
                 continue
+            self.frames_parsed += 1
             try:
                 # Multiple antenna values are comma-separated; strongest is useful for hunting.
                 signals = [int(x) for x in row[2].split(",") if x]
+                if not signals:
+                    self.frames_without_rssi += 1
+                    continue
                 raw_ssid = row[5] if "wlan.ssid_raw" in self.fields else ""
                 self._emit(
                     (
@@ -91,7 +100,9 @@ class TsharkCapture:
                         _integer(row[4]),
                     )
                 )
+                self.frames_with_rssi += 1
             except ValueError:
+                self.parse_errors += 1
                 continue
 
     def _emit(self, event: CaptureEvent) -> None:
