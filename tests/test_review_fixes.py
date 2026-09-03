@@ -271,6 +271,21 @@ class ReviewFixTests(unittest.TestCase):
         self.assertIn("not seen during 2 complete sweeps of its known band", rendered)
         self.assertIn("Unknown-band APs use 1 minute", rendered)
 
+    def test_short_help_prioritizes_key_references_over_gray_details(self):
+        screen = FakeScreen(height=12, width=100)
+        app = self.make_app(screen)
+        app.help_visible = True
+
+        app._draw_help()
+
+        rendered = " ".join(text for _, text, _ in screen.writes)
+        self.assertIn("[2] toggle 2.4 GHz", rendered)
+        self.assertIn("[6] toggle 6 GHz", rendered)
+        self.assertIn("[F] filter", rendered)
+        self.assertIn("[Enter] hunt", rendered)
+        self.assertIn("[D] diagnostics", rendered)
+        self.assertNotIn("Unknown-band APs use 1 minute", rendered)
+
     def test_ctrl_c_stops_application_while_help_is_open(self):
         screen = FakeScreen()
         app = self.make_app(screen)

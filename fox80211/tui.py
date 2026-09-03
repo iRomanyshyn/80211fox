@@ -894,13 +894,13 @@ class Application:
                 "CAC = channel availability check; NOP = channel temporarily unavailable.",
                 0,
             ),
-            ("Gray ?: not seen during 2 complete sweeps of its known band.", 0),
-            ("Unknown-band APs use 1 minute because no band sweep can be tracked.", 0),
             ("", 0),
             ("[2] toggle 2.4 GHz networks   [5] toggle 5 GHz networks", 0),
             ("[6] toggle 6 GHz networks     on/off in the footer shows visibility.", 0),
             ("[F] filter  [R] clear  [Space] pause/resume  [Enter] hunt", 0),
             ("[D] diagnostics  [Up/Down] select", 0),
+            ("Gray ?: not seen during 2 complete sweeps of its known band.", 0),
+            ("Unknown-band APs use 1 minute because no band sweep can be tracked.", 0),
         )
         for row, (line, attr) in enumerate(lines[: max(0, height - 1)]):
             self.screen.addnstr(row, 0, line, width - 1, attr)
