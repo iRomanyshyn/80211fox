@@ -9,6 +9,9 @@ import threading
 import time
 from functools import lru_cache
 
+from .dfs import ChannelSwitch
+from .model import MISSING_SSID
+
 DISCOVERY_FILTER = "wlan.fc.type_subtype == 8 || wlan.fc.type_subtype == 5"
 EVENT_QUEUE_SIZE = 1024
 TARGET_EVENT_INTERVAL = 0.05
@@ -25,12 +28,19 @@ class TsharkCapture:
         "wlan_radio.channel",
         "wlan_radio.frequency",
     )
-    OPTIONAL_FIELDS = ("wlan.ssid_raw",)
+    OPTIONAL_FIELDS = (
+        "wlan.ssid_raw",
+        "wlan_mgt.tag.csa.new_channel",
+        "wlan_mgt.extended_channel_switch_announcement.new_channel",
+        "wlan_mgt.tag.ext_csa.new_channel",
+        "wlan.csa.new_channel_number",
+    )
 
     def __init__(self, interface: str, target_bssid: str | None = None):
         self.interface = interface
         self.target_bssid = _validated_bssid(target_bssid) if target_bssid else None
         self.events: queue.Queue[CaptureEvent] = queue.Queue(maxsize=EVENT_QUEUE_SIZE)
+        self.channel_switches: queue.Queue[ChannelSwitch] = queue.Queue(maxsize=128)
         self.process: subprocess.Popen[str] | None = None
         self.reader: threading.Thread | None = None
         self.stderr = tempfile.TemporaryFile(mode="w+t")
@@ -100,6 +110,20 @@ class TsharkCapture:
                         _integer(row[4]),
                     )
                 )
+                values = dict(zip(self.fields, row))
+                switch = extract_channel_switch(values, row[0], _integer(row[3]))
+                if switch:
+                    try:
+                        self.channel_switches.put_nowait(switch)
+                    except queue.Full:
+                        try:
+                            self.channel_switches.get_nowait()
+                        except queue.Empty:
+                            pass
+                        try:
+                            self.channel_switches.put_nowait(switch)
+                        except queue.Full:
+                            pass
                 self.frames_with_rssi += 1
             except ValueError:
                 self.parse_errors += 1
@@ -206,11 +230,42 @@ def _ssid(value: str, raw_value: str = "", value_is_bytes: bool = False) -> str:
         decoded = value
     else:
         if not raw or not any(raw):
-            return "<hidden>"
+            return MISSING_SSID
         decoded = raw.decode("utf-8", errors="replace")
     return (
         "".join(character if character.isprintable() else "�" for character in decoded)
-        or "<hidden>"
+        or MISSING_SSID
+    )
+
+
+def extract_channel_switch(
+    values: dict[str, str],
+    bssid: str,
+    old_channel: int | None,
+    timestamp: float | None = None,
+) -> ChannelSwitch | None:
+    """Extract CSA/ECSA without interpreting it as radar."""
+    names = (
+        "wlan_mgt.tag.csa.new_channel",
+        "wlan_mgt.extended_channel_switch_announcement.new_channel",
+        "wlan_mgt.tag.ext_csa.new_channel",
+        "wlan.csa.new_channel_number",
+    )
+    target = next(
+        (
+            _integer(values.get(name, ""))
+            for name in names
+            if _integer(values.get(name, "")) is not None
+        ),
+        None,
+    )
+    if target is None:
+        return None
+    return ChannelSwitch(
+        time.time() if timestamp is None else timestamp,
+        bssid.upper(),
+        old_channel,
+        target,
     )
 
 

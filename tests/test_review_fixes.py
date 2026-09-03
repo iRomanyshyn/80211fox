@@ -95,8 +95,8 @@ class ReviewFixTests(unittest.TestCase):
         self.assertEqual(_ssid("1234"), "1234")
         self.assertEqual(_ssid("0000"), "0000")
 
-    def test_hidden_and_plain_text_ssids_are_preserved(self):
-        self.assertEqual(_ssid(""), "<hidden>")
+    def test_missing_and_plain_text_ssids_are_preserved(self):
+        self.assertEqual(_ssid(""), "<MISSING>")
         self.assertEqual(
             _ssid("Office Wi-Fi", "4f66666963652057692d4669"), "Office Wi-Fi"
         )
@@ -119,14 +119,14 @@ class ReviewFixTests(unittest.TestCase):
             _ssid("unhelpful", "53796e74686574696353534944"), "SyntheticSSID"
         )
 
-    def test_null_filled_ssids_are_hidden(self):
-        self.assertEqual(_ssid("0000", "0000"), "<hidden>")
+    def test_null_filled_ssids_are_missing(self):
+        self.assertEqual(_ssid("0000", "0000"), "<MISSING>")
 
     def test_hidden_beacon_does_not_replace_learned_ssid(self):
         app = self.make_app()
         app.aps["AA"] = AccessPoint("AA", "Office", -50, 1, 2412)
         capture = Mock(events=queue.Queue())
-        capture.events.put(("AA", "<hidden>", -49, 1, 2412))
+        capture.events.put(("AA", "<MISSING>", -49, 1, 2412))
         app._events(capture)
         self.assertEqual(app.aps["AA"].ssid, "Office")
 

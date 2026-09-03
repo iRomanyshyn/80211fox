@@ -37,7 +37,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(list(ap.rssi_history), [(105.0, -40), (111.0, -20)])
 
     def test_strength_drives_label_and_cadence(self):
-        self.assertEqual(proximity(-80)[0], "WEAK")
+        self.assertEqual(proximity(-80)[0], "FAR OR OBSTRUCTED")
         self.assertEqual(proximity(-30)[0], "VERY CLOSE")
         self.assertLess(beep_interval(-35), beep_interval(-75))
 

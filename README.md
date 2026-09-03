@@ -45,6 +45,8 @@ in `system.py`.
   beep cadence. The raw current value remains visible. RSSI is suitable for
   relative proximity tracking with the same adapter; absolute readings should
   not be compared between different adapters or driver stacks.
+  HUNT's proximity wording is an estimate, not a distance measurement: walls,
+  multipath, transmit power, antennas, and laptop orientation all affect RSSI.
 - The selected PHY is dedicated to hunting. Its original interface is made
   unmanaged and down before a separate monitor VIF is attempted, preventing
   NetworkManager background scans from fighting channel hopping on the same
@@ -108,6 +110,34 @@ the duration of the last complete sweep, so slow driver/firmware channel
 switches are visible rather than hidden in the dwell period. Scan retention is
 automatically enlarged when a measured sweep requires it. HUNT stretches its signal bar to the available
 terminal width.
+
+## DFS and channel-switch diagnostics
+
+80211fox remains entirely passive. It reads the kernel regulatory view from
+`iw phy … info`, listens to local nl80211 notifications through `iw event`, and
+observes CSA/ECSA elements in frames already captured by TShark. Diagnostics
+report each source as available or unavailable; missing fields or driver support
+reduce coverage rather than stopping capture.
+
+- **DFS** means a channel requires Dynamic Frequency Selection.
+- **RADAR** appears only after a confirmed radar-detection event from the
+  selected local Linux Wi-Fi PHY.
+- **DFS MOVE** means an AP announced a move away from a DFS channel. Radar is
+  not confirmed: controller RRM/DCA, interference management, or manual
+  configuration can also cause the move.
+- **CAC** is the Channel Availability Check before using a DFS channel.
+- **NOP** is the Non-Occupancy Period after radar detection, during which the
+  affected channel must not be used for the regulatory-defined period.
+- **CSA** is an ordinary observed Channel Switch Announcement where calling it
+  DFS-related is not justified.
+
+The selected adapter's local CAC/NOP/DFS state is **not** automatically the
+state of a remote Cisco, Aruba, or other AP. A CSA alone is never presented as
+confirmed radar. When a captured frame does not provide usable SSID bytes, the
+UI uses the reserved marker `<MISSING>`. This often occurs for a hidden network's
+zero-length beacon SSID, but it is not proof that the network is hidden: target
+data frames do not contain an SSID, and capture/dissector limitations can also
+make the field unavailable.
 
 Cleanup is context-managed. Normal exit, Ctrl-C, closing the terminal (SIGHUP),
 the installed SIGTERM handler, and Python exceptions stop
