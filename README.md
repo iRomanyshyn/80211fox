@@ -85,11 +85,13 @@ settings may suppress or render visually); `--sound off` disables sound.
 ## Controls
 
 In SCAN, press `2`, `5`, or `6` to toggle networks in the corresponding Wi-Fi
-band; the control bar shows which bands are enabled. Networks whose frequency
+band (`2` = 2.4 GHz, `5` = 5 GHz, and `6` = 6 GHz); the control bar shows which
+bands are enabled. Networks whose frequency
 has not yet been identified remain visible. Press `D` for measured channel-tune
 and sweep timing, capture/RSSI counters, and per-frequency rejection reasons;
 use Up/Down to inspect every rejected frequency, then press `D` or Escape to
-return. Press `R` to clear all accumulated
+return. Press `H` or `?` for an in-app key reference and glossary of the table's
+status labels. Press `R` to clear all accumulated
 networks (live networks may be discovered again immediately). Press `F` to open
 the highlighted filter field, then type to filter
 dynamically by partial case-insensitive SSID or BSSID; punctuation and case in
@@ -99,7 +101,7 @@ the edit, arrows select, and Enter starts HUNT outside the filter field. Space
 freezes or resumes the scan, including its access-point values and ordering. In
 HUNT, `B` toggles cadence beeps, `R` resets statistics, Escape returns to
 scanning, and `Q` quits. Without a target frame, beeps stop and HUNT displays
-`SIGNAL LOST` after two seconds on 2.4 GHz or five seconds on 5 GHz. SCAN sorts
+`SIGNAL LOST` after two seconds on 2.4 GHz or five seconds on 5/6 GHz. SCAN sorts
 all observations by smoothed RSSI, dims an AP and marks it with `?` after one
 minute without a frame, and removes it after thirty minutes. Its text follows
 the smoothed RSSI through a signal color gradient (with a simpler fallback on limited terminals),
