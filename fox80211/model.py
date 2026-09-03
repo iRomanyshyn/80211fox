@@ -5,6 +5,24 @@ from collections import deque
 from dataclasses import dataclass, field
 
 RSSI_HISTORY_SECONDS = 10.0
+# An absent SSID is not proof that an AP is configured as a hidden network.
+# Data frames do not carry an SSID, and dissector/version limitations can also
+# leave the field empty, so use a deliberately observation-based label.
+MISSING_SSID = "<MISSING>"
+
+
+@dataclass(frozen=True)
+class Channel:
+    """One frequency in the kernel's current regulatory view."""
+
+    frequency: int
+    number: int
+    disabled: bool = False
+    no_ir: bool = False
+    radar: bool = False
+    dfs_state: str | None = None
+    cac_ms: int | None = None
+    restrictions: tuple[str, ...] = ()
 
 
 def normalize_mac(value: str) -> str:
@@ -36,6 +54,9 @@ class AccessPoint:
     minimum: int | None = None
     maximum: int | None = None
     rssi_history: deque[tuple[float, int]] = field(default_factory=deque)
+    event_label: str = "-"
+    event_target: int | None = None
+    event_seen: float | None = None
 
     def __post_init__(self) -> None:
         if not self.rssi_history:

@@ -5,7 +5,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from .model import Adapter
+from .model import Adapter, Channel
 
 _APP_MONITOR = re.compile(r"^whmon(\d+)$")
 
@@ -164,19 +164,48 @@ def _monitor_phys() -> set[str]:
     return result
 
 
+def parse_channels(text: str) -> list[Channel]:
+    """Parse frequency flags emitted by multiple generations of ``iw``."""
+    result: list[Channel] = []
+    for line in text.splitlines():
+        match = re.search(r"\*\s+(\d+)(?:\.0+)?\s+MHz\s+\[(\d+)\](.*)", line)
+        if not match:
+            continue
+        tail = match.group(3)
+        flags = tuple(x.strip() for x in re.findall(r"\(([^()]*)\)", tail))
+        lower = tail.casefold()
+        state_match = re.search(
+            r"dfs state:\s*([a-z_ -]+?)(?:\s*\(|,|$)", tail, re.IGNORECASE
+        )
+        cac_match = re.search(r"cac time:\s*(\d+)\s*ms", tail, re.IGNORECASE)
+        result.append(
+            Channel(
+                int(match.group(1)),
+                int(match.group(2)),
+                "disabled" in lower,
+                "no ir" in lower or "no-ir" in lower,
+                "radar detection" in lower or bool(state_match),
+                state_match.group(1).strip().upper().replace(" ", "_")
+                if state_match
+                else None,
+                int(cac_match.group(1)) if cac_match else None,
+                flags,
+            )
+        )
+    return result
+
+
+def available_channels(phy: str) -> list[Channel]:
+    return parse_channels(run("iw", "phy", phy, "info"))
+
+
 def available_frequencies(phy: str) -> list[tuple[int, int]]:
     """Return enabled (frequency MHz, channel) pairs from the current regdomain."""
-    text = run("iw", "phy", phy, "info")
-    found: list[tuple[int, int]] = []
-    for line in text.splitlines():
-        # iw may render frequencies with a decimal (for example, ``2412.0
-        # MHz``), while other releases render ``2412 MHz``. Channel tuning
-        # still uses whole MHz here, so accept either representation when the
-        # fractional component is zero.
-        match = re.search(r"\*\s+(\d+)(?:\.0+)?\s+MHz\s+\[(\d+)\]", line)
-        if match and "disabled" not in line:
-            found.append((int(match.group(1)), int(match.group(2))))
-    return found
+    return [
+        (item.frequency, item.number)
+        for item in available_channels(phy)
+        if not item.disabled
+    ]
 
 
 class MonitorInterface:

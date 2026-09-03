@@ -5,13 +5,15 @@ import queue
 import subprocess
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
-from .capture import TsharkCapture
-from .model import AccessPoint, Adapter
+from .capture import CSA_FIELDS, TsharkCapture
+from .dfs import ChannelSwitch, DfsEvent, DfsEventMonitor, DfsKind, EventHistory
+from .model import AccessPoint, Adapter, Channel, MISSING_SSID
 from .sound import SoundBackend, TerminalBell
-from .system import MonitorInterface, available_frequencies
+from .system import MonitorInterface, available_channels
 
 UNCERTAIN_AFTER = 60.0
 BANDS = (2, 5, 6)
@@ -62,6 +64,86 @@ class TuneStatistics:
         self.latest = elapsed
         self.ewma = elapsed if self.ewma is None else 0.25 * elapsed + 0.75 * self.ewma
         self.samples += 1
+
+
+@dataclass(frozen=True)
+class ScanLayout:
+    width: int
+    signal: bool
+    frequency: bool
+    bssid: bool
+    last: bool
+    ssid_width: int
+
+
+@dataclass(frozen=True)
+class HuntNotice:
+    expires: float
+    bssid: str
+    title: str
+    body: tuple[str, ...]
+
+
+def scan_layout(width: int) -> ScanLayout:
+    """Central responsive policy; DFS/event is never sacrificed for extras."""
+    usable = max(1, width - 1)
+    signal = usable >= 115
+    frequency = usable >= 105
+    bssid = usable >= 62
+    last = usable >= 78
+    fixed = 5 + 5 + 10  # RSSI, channel, event
+    fixed += 18 if bssid else 0
+    fixed += 7 if last else 0
+    fixed += 7 if frequency else 0
+    fixed += 20 if signal else 0
+    return ScanLayout(usable, signal, frequency, bssid, last, max(8, usable - fixed))
+
+
+def scan_header(layout: ScanLayout) -> str:
+    parts = ["RSSI", "CH", "EVENT"]
+    if layout.signal:
+        parts.append("SIGNAL")
+    if layout.frequency:
+        parts.append("FREQ")
+    if layout.bssid:
+        parts.append("BSSID")
+    parts.append("SSID")
+    if layout.last:
+        parts.append("LAST")
+    return "  ".join(parts)[: layout.width]
+
+
+def scan_row(
+    ap: AccessPoint,
+    age: float,
+    layout: ScanLayout,
+    dfs: bool = False,
+    dfs_state: str | None = None,
+) -> str:
+    event = ap.event_label
+    if ap.event_target is not None and event in ("MOVE", "CSA"):
+        event += f"→{ap.event_target}"
+    if event == "-" and dfs:
+        event = (
+            "NOP"
+            if dfs_state == "UNAVAILABLE"
+            else ("CAC" if dfs_state == "CAC" else "DFS")
+        )
+    parts = [
+        f"{round(smoothed_rssi(ap)):4}",
+        f"{ap.channel or '?':>3}",
+        f"{event:<8.8}",
+    ]
+    if layout.signal:
+        parts.append(f"{proximity(smoothed_rssi(ap))[0]:<18.18}")
+    if layout.frequency:
+        parts.append(f"{ap.frequency or '?':>5}")
+    if layout.bssid:
+        parts.append(f"{ap.bssid:<17.17}")
+    parts.append(f"{ap.ssid:<{layout.ssid_width}.{layout.ssid_width}}")
+    if layout.last:
+        parts.append(("?" if age >= UNCERTAIN_AFTER else " ") + format_age(age))
+    return " ".join(parts)[: layout.width]
 
 
 def select_adapter(screen: curses.window, adapters: list[Adapter]) -> Adapter:
@@ -138,9 +220,19 @@ class Application:
         self.capture_totals = [0, 0, 0, 0]
         self.diagnostics = False
         self.diagnostics_selected = 0
+        self.channels: dict[int, Channel] = {}
+        self.event_history = EventHistory()
+        self.dfs_monitor: DfsEventMonitor | None = None
+        self.hunt_notice: HuntNotice | None = None
+        self.deferred_dfs_events: deque[DfsEvent | ChannelSwitch] = deque(maxlen=256)
+        self.csa_available = False
 
     def run(self) -> None:
-        frequencies = available_frequencies(self.adapter.phy)
+        channels = available_channels(self.adapter.phy)
+        self.channels = {item.frequency: item for item in channels}
+        frequencies = [
+            (item.frequency, item.number) for item in channels if not item.disabled
+        ]
         self.channel_by_frequency = dict(frequencies)
         # Keep observations for longer than a complete sweep.  The extra dwell
         # leaves room for tune and scheduling overhead between revisits.
@@ -150,6 +242,13 @@ class Application:
         with MonitorInterface(self.adapter) as monitor:
             capture = TsharkCapture(monitor.name)
             capture.start()
+            self.csa_available = bool(set(capture.fields) & set(CSA_FIELDS))
+            dfs = DfsEventMonitor(self.adapter.phy)
+            try:
+                dfs.start()
+                self.dfs_monitor = dfs
+            except (OSError, subprocess.SubprocessError):
+                dfs.stderr.close()
             self.capture_statistics = capture
             hopper = threading.Thread(
                 target=self._hop,
@@ -166,6 +265,7 @@ class Application:
                     if not self.running:
                         break
                     self._events(capture, apply=not self.paused)
+                    self._dfs_events(capture, apply=not self.paused)
                     desired_target = self.hunt.bssid if self.hunt else None
                     if capture.target_bssid != (
                         desired_target.casefold() if desired_target else None
@@ -183,6 +283,134 @@ class Application:
                 self.stop_event.set()
                 hopper.join(timeout=2)
                 capture.stop()
+                if self.dfs_monitor:
+                    self.dfs_monitor.stop()
+
+    def _dfs_events(self, capture: TsharkCapture, apply: bool = True) -> None:
+        pending = list(self.deferred_dfs_events) if apply else []
+        if apply:
+            self.deferred_dfs_events.clear()
+        if self.dfs_monitor:
+            while True:
+                try:
+                    event = self.dfs_monitor.events.get_nowait()
+                except queue.Empty:
+                    break
+                pending.append(event)
+        switches = getattr(capture, "channel_switches", None)
+        if switches is not None:
+            while True:
+                try:
+                    pending.append(switches.get_nowait())
+                except queue.Empty:
+                    break
+        if not apply:
+            self.deferred_dfs_events.extend(pending)
+            return
+        for raw_event in pending:
+            if isinstance(raw_event, DfsEvent):
+                self._apply_local_dfs_event(raw_event)
+                continue
+            switch = raw_event
+            ap = self.aps.get(switch.bssid)
+            old_frequency = ap.frequency if ap else None
+            original = self.channels.get(old_frequency or 0)
+            switch = ChannelSwitch(
+                switch.timestamp,
+                switch.bssid,
+                switch.old_channel or (ap.channel if ap else None),
+                switch.target_channel,
+                switch.target_frequency,
+                bool(original and original.radar),
+                switch.switch_count,
+                switch.operating_class,
+            )
+            self.event_history.add(switch)
+            if ap:
+                confirmed = self.event_history.radar_for(
+                    old_frequency, switch.timestamp
+                )
+                ap.event_label = (
+                    "RADAR+MOVE"
+                    if confirmed
+                    else ("MOVE" if switch.from_dfs else "CSA")
+                )
+                ap.event_target, ap.event_seen = switch.target_channel, switch.timestamp
+                source_band = network_band(old_frequency)
+                target = next(
+                    (
+                        channel
+                        for channel in self.channels.values()
+                        if channel.number == switch.target_channel
+                        and network_band(channel.frequency) == source_band
+                    ),
+                    None,
+                )
+                # Do not leave the announcing AP before its countdown reaches
+                # zero. A later observation on the new channel also updates the
+                # target naturally if the zero-count frame is missed.
+                if target and switch.switch_count == 0:
+                    # The hopper observes this model update under its tune lock
+                    # and follows the selected BSSID to the announced channel.
+                    ap.channel, ap.frequency = target.number, target.frequency
+                if self.hunt is ap:
+                    self.hunt_notice = hunt_notification(
+                        switch, switch.old_channel, bssid=ap.bssid
+                    )
+
+    def _apply_local_dfs_event(self, event: DfsEvent) -> None:
+        self.event_history.add(event)
+        matches = [
+            channel
+            for channel in self.channels.values()
+            if (event.frequency is not None and channel.frequency == event.frequency)
+            or (
+                event.frequency is None
+                and event.channel is not None
+                and channel.number == event.channel
+            )
+        ]
+        # Channel-only events can be ambiguous across bands; do not mutate an
+        # unrelated cached regulatory state in that case.
+        if event.frequency is not None or len(matches) == 1:
+            states = {
+                DfsKind.RADAR: "UNAVAILABLE",
+                DfsKind.CAC_STARTED: "CAC",
+                DfsKind.CAC_FINISHED: "AVAILABLE",
+                DfsKind.CAC_ABORTED: None,
+                DfsKind.NOP_FINISHED: "USABLE",
+                DfsKind.PRE_CAC_EXPIRED: "USABLE",
+            }
+            for channel in matches:
+                self.channels[channel.frequency] = replace(
+                    channel, dfs_state=states[event.kind]
+                )
+        channel_number = event.channel or self.channel_by_frequency.get(
+            event.frequency or 0
+        )
+        for ap in self.aps.values():
+            relevant = (
+                event.frequency is not None and ap.frequency == event.frequency
+            ) or (
+                event.frequency is None
+                and event.channel is not None
+                and ap.channel == event.channel
+            )
+            if relevant:
+                ap.event_label = event.kind.value
+                ap.event_seen = event.timestamp
+        if self.hunt:
+            relevant = (
+                event.frequency is not None and self.hunt.frequency == event.frequency
+            ) or (
+                event.frequency is None
+                and event.channel is not None
+                and self.hunt.channel == event.channel
+            )
+            if relevant:
+                self.hunt_notice = hunt_notification(
+                    event, channel_number, bssid=self.hunt.bssid
+                )
 
     @staticmethod
     def _replace_capture(
@@ -271,8 +499,9 @@ class Application:
                         if self.locking_hunt and not self._lock_frequency(
                             monitor,
                             requested_frequency,
-                            cancelled=lambda target=target: self.stop_event.is_set()
-                            or self.hunt is not target,
+                            cancelled=lambda target=target: (
+                                self.stop_event.is_set() or self.hunt is not target
+                            ),
                         ):
                             continue
                         if self.hunt is target:
@@ -313,7 +542,7 @@ class Application:
                 continue
             ap = self.aps.get(bssid)
             if ap:
-                if ssid != "<hidden>" or ap.ssid == "<hidden>":
+                if ssid != MISSING_SSID or ap.ssid == MISSING_SSID:
                     ap.ssid = ssid
                 ap.update(rssi, channel, frequency)
             else:
@@ -374,6 +603,7 @@ class Application:
         elif self.hunt:
             if key in (27, "\x1b"):
                 self.hunt = None
+                self.hunt_notice = None
                 self.locking_hunt = False
                 self.lock_attempt = 0
                 self.lock_detail = None
@@ -432,6 +662,7 @@ class Application:
                     # busy driver from the UI thread: doing so stops event
                     # draining and drawing for several seconds.
                     self.hunt = target
+                    self.hunt_notice = None
                     # Treat the request as locking until the hopper acquires
                     # tune_lock and verifies which frequency the radio is
                     # actually using.
@@ -524,11 +755,8 @@ class Application:
             ),
             width - 1,
         )
-        self.screen.addstr(
-            2,
-            0,
-            "RSSI   CH    FREQ   BSSID              SSID                        LAST",
-        )
+        layout = scan_layout(width)
+        self.screen.addnstr(2, 0, scan_header(layout), width - 1)
         if self.tune_error:
             self.screen.addnstr(
                 1, 0, self.tune_error, self.screen.getmaxyx()[1] - 1, curses.A_BOLD
@@ -545,11 +773,26 @@ class Application:
             now = self.paused_at if self.paused_at is not None else time.monotonic()
             age = now - ap.last_seen
             rssi = round(smoothed_rssi(ap))
-            uncertain = "?" if age >= UNCERTAIN_AFTER else " "
-            line = f"{rssi:4}  {str(ap.channel or '?'):>4}  {str(ap.frequency or '?'):>5}  {ap.bssid:17}  {ap.ssid:25.25}  {uncertain}{format_age(age)}"
+            metadata = self.channels.get(ap.frequency or 0)
+            line = scan_row(
+                ap,
+                age,
+                layout,
+                bool(metadata and metadata.radar),
+                metadata.dfs_state if metadata else None,
+            )
             # Stale observations must be visually distinct from live signal
             # strength, so do not retain a signal-gradient colour for them.
             attr = curses.A_DIM if age >= UNCERTAIN_AFTER else scan_signal_attr(rssi)
+            if age < UNCERTAIN_AFTER:
+                state_label = (
+                    "NOP"
+                    if metadata and metadata.dfs_state == "UNAVAILABLE"
+                    else "CAC"
+                    if metadata and metadata.dfs_state == "CAC"
+                    else ap.event_label
+                )
+                attr = event_attr(state_label, bool(metadata and metadata.radar), attr)
             if index == self.selected:
                 attr |= curses.A_REVERSE
             self.screen.addnstr(3 + row, 0, line, width - 1, attr)
@@ -601,8 +844,46 @@ class Application:
                 f"without RSSI {counters[2]}   parse errors {counters[3]}"
             )
             self.screen.addnstr(3, 0, capture_line, width - 1)
-        self.screen.addnstr(5, 0, "Rejected frequencies", width - 1, curses.A_BOLD)
-        rows = max(0, height - 7)
+        states = (
+            "available"
+            if self.channels and any(c.dfs_state for c in self.channels.values())
+            else "unavailable"
+        )
+        radar = (
+            "available"
+            if self.dfs_monitor and self.dfs_monitor.available
+            else "unavailable"
+        )
+        csa = "available" if self.csa_available else "unavailable"
+        self.screen.addnstr(
+            4,
+            0,
+            f"DFS: states {states}; local radar events {radar}; CSA {csa}",
+            width - 1,
+        )
+        self.screen.addnstr(
+            5,
+            0,
+            "DFS=radar-sensitive  RADAR=local confirmation  MOVE=cause unknown  CAC=check  NOP=unavailable",
+            width - 1,
+        )
+        history = list(self.event_history.items)[-2:] if height >= 12 else []
+        if height >= 12:
+            self.screen.addnstr(
+                6, 0, "Recent DFS/channel events", width - 1, curses.A_BOLD
+            )
+        for index, event in enumerate(history, 7):
+            stamp = time.strftime("%H:%M:%S", time.localtime(event.timestamp))
+            if isinstance(event, ChannelSwitch):
+                detail = f"{stamp} {event.bssid} {event.label} {event.old_channel or '?'}→{event.target_channel or '?'}"
+            else:
+                detail = f"{stamp} CH{event.channel or self.channel_by_frequency.get(event.frequency or 0, '?')} {event.kind.value}"
+            self.screen.addnstr(index, 0, detail, width - 1)
+        rejected_row = (7 + len(history)) if height >= 12 else 6
+        self.screen.addnstr(
+            rejected_row, 0, "Rejected frequencies", width - 1, curses.A_BOLD
+        )
+        rows = max(0, height - rejected_row - 2)
         with self.tune_lock:
             rejected = sorted(self.rejected_frequencies.items())
         self.diagnostics_selected = min(
@@ -612,11 +893,13 @@ class Application:
             max(0, self.diagnostics_selected - rows + 1),
             max(0, len(rejected) - rows),
         )
-        for row, (frequency, reason) in enumerate(rejected[offset : offset + rows], 6):
+        for row, (frequency, reason) in enumerate(
+            rejected[offset : offset + rows], rejected_row + 1
+        ):
             channel = self.channel_by_frequency.get(frequency, "?")
             attr = (
                 curses.A_REVERSE
-                if offset + row - 6 == self.diagnostics_selected
+                if offset + row - rejected_row - 1 == self.diagnostics_selected
                 else 0
             )
             self.screen.addnstr(
@@ -696,6 +979,27 @@ class Application:
             f"current {ap.rssi:4}   avg {smooth:5.1f}   min {minimum:4}   max {maximum:4}",
         )
         self.screen.addstr(12, 2, f"last {age:5.2f}s   samples {ap.samples}")
+        self.screen.addnstr(
+            13,
+            2,
+            "RSSI proximity is approximate; walls and antenna orientation affect it.",
+            max(0, terminal_width - 3),
+        )
+        if (
+            self.hunt_notice
+            and self.hunt_notice.bssid == ap.bssid
+            and time.monotonic() < self.hunt_notice.expires
+        ):
+            title, body = self.hunt_notice.title, self.hunt_notice.body
+            start = 9 if height >= 20 else 1
+            self.screen.addnstr(
+                start, 2, title, max(0, terminal_width - 3), curses.A_BOLD
+            )
+            for offset, text in enumerate(body, 1):
+                if start + offset < height - 1:
+                    self.screen.addnstr(
+                        start + offset, 2, text, max(0, terminal_width - 3)
+                    )
         self._draw_hunt_controls(terminal_width)
         if self.beep and time.monotonic() - self.last_beep >= beep_interval(smooth):
             self.sound.beep()
@@ -789,7 +1093,7 @@ def scan_controls(action: str, enabled_bands: set[int], width: int) -> str:
     variants = (
         f"[F] filter [R] clear [Space] {action} [Enter] hunt [Q] quit",
         f"[R] clear [Space] {action} [Enter] hunt [Q] quit",
-        f"[R] clear [Enter] hunt [Q] quit",
+        "[R] clear [Enter] hunt [Q] quit",
         "[R] clear [Q] quit",
         "[Q] quit",
     )
@@ -828,6 +1132,21 @@ def scan_signal_attr(rssi: float) -> int:
     return attr
 
 
+def event_attr(label: str, dfs: bool, fallback: int = 0) -> int:
+    """Semantic colour with readable text and a monochrome attribute fallback."""
+    if label.startswith("RADAR"):
+        return (curses.color_pair(1) if color_pairs_configured else 0) | curses.A_BOLD
+    if label.startswith("NOP"):
+        return (curses.color_pair(5) if color_pairs_configured else 0) | curses.A_BOLD
+    if label.startswith("CAC") or label in ("MOVE", "CSA"):
+        return (curses.color_pair(2) if color_pairs_configured else 0) | curses.A_BOLD
+    if dfs:
+        # Keep the row's RSSI gradient: the textual DFS label supplies the
+        # regulatory distinction without hiding the primary hunting cue.
+        return fallback
+    return fallback
+
+
 def hunt_lost_after(frequency: int | None) -> float:
     return (
         HIGH_BAND_LOST_AFTER
@@ -846,15 +1165,60 @@ def format_age(seconds: float) -> str:
 
 
 def proximity(rssi: float) -> tuple[str, int]:
-    if rssi < -75:
-        return "WEAK", 1
-    if rssi < -60:
-        return "MODERATE", 2
-    if rssi < -45:
-        return "GOOD", 3
-    if rssi < -35:
-        return "CLOSE", 4
+    if rssi < -82:
+        return "VERY FAR / HEAVILY OBSTRUCTED", 1
+    if rssi < -72:
+        return "FAR OR OBSTRUCTED", 1
+    if rssi < -62:
+        return "SOME DISTANCE", 2
+    if rssi < -52:
+        return "CLOSE", 3
+    if rssi < -42:
+        return "NEARBY", 4
     return "VERY CLOSE", 5
+
+
+def hunt_notification(
+    event: DfsEvent | ChannelSwitch,
+    channel: int | None,
+    now: float | None = None,
+    bssid: str = "",
+) -> HuntNotice:
+    expires = (time.monotonic() if now is None else now) + 12.0
+    ch = channel or "?"
+    if isinstance(event, ChannelSwitch):
+        return HuntNotice(
+            expires,
+            bssid or event.bssid,
+            "CHANNEL SWITCH ANNOUNCED",
+            (
+                f"The target AP announced a move from channel {ch} to channel {event.target_channel or '?'}.",
+                "A DFS move can have several causes. Radar is not confirmed by a CSA.",
+            ),
+        )
+    if event.kind is DfsKind.RADAR:
+        return HuntNotice(
+            expires,
+            bssid,
+            "RADAR DETECTED",
+            (
+                f"The local Wi-Fi adapter reported radar on channel {ch}.",
+                "DFS rules require affected transmitters to leave; the target may move.",
+            ),
+        )
+    if event.kind is DfsKind.CAC_STARTED:
+        return HuntNotice(
+            expires,
+            bssid,
+            "DFS CAC",
+            (f"Channel {ch} is undergoing a Channel Availability Check.",),
+        )
+    return HuntNotice(
+        expires,
+        bssid,
+        event.kind.value,
+        (f"Local DFS event reported for channel {ch}.",),
+    )
 
 
 def beep_interval(rssi: float) -> float:
