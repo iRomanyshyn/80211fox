@@ -102,10 +102,12 @@ freezes or resumes the scan, including its access-point values and ordering. In
 HUNT, `B` toggles cadence beeps, `R` resets statistics, Escape returns to
 scanning, and `Q` quits. Without a target frame, beeps stop and HUNT displays
 `SIGNAL LOST` after two seconds on 2.4 GHz or five seconds on 5/6 GHz. SCAN sorts
-all observations by smoothed RSSI, grays an AP and marks it with `?` when it was
-not rediscovered during two complete sweeps of its enabled band (or after one
-minute without a frame), and removes it after at least thirty minutes. Its text
-follows
+all observations by smoothed RSSI. An AP with a known band is grayed and marked
+with `?` only after it was not rediscovered during two complete sweeps of that
+enabled band, regardless of how long those sweeps take. The one-minute fallback
+applies only when an AP's frequency cannot be assigned to a band, because no
+corresponding band sweep can be tracked. An AP is removed after at least thirty
+minutes. Its text follows
 the smoothed RSSI through a signal color gradient (with a simpler fallback on limited terminals),
 while the LAST column makes observation age explicit. Its status reports
 usable/rejected tunes; a failed HUNT lock is reported in SCAN rather than

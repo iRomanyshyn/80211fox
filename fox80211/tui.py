@@ -894,6 +894,8 @@ class Application:
                 "CAC = channel availability check; NOP = channel temporarily unavailable.",
                 0,
             ),
+            ("Gray ?: not seen during 2 complete sweeps of its known band.", 0),
+            ("Unknown-band APs use 1 minute because no band sweep can be tracked.", 0),
             ("", 0),
             ("[2] toggle 2.4 GHz networks   [5] toggle 5 GHz networks", 0),
             ("[6] toggle 6 GHz networks     on/off in the footer shows visibility.", 0),
@@ -1144,9 +1146,13 @@ def scan_is_uncertain(
 ) -> bool:
     """Return whether an AP should be greyed as no longer reliably present."""
     band = network_band(ap.frequency)
+    # A wall-clock fallback is meaningful only when an observation cannot be
+    # assigned to a band.  For known bands, always wait for two complete band
+    # sweeps, however long they take, before deciding that the AP was missed.
+    if band is None:
+        return age >= UNCERTAIN_AFTER
     sweeps = completed_sweep_starts.get(band, ())
-    missed_two_sweeps = len(sweeps) >= 2 and ap.last_seen < sweeps[0]
-    return missed_two_sweeps or age >= UNCERTAIN_AFTER
+    return len(sweeps) >= 2 and ap.last_seen < sweeps[0]
 
 
 def capture_counters(capture: TsharkCapture) -> tuple[int, int, int, int]:
@@ -1215,9 +1221,9 @@ def scan_controls(action: str, enabled_bands: set[int], width: int) -> str:
         f"{band}:{'on' if band in enabled_bands else 'off'}" for band in BANDS
     )
     for suffix in (
-        f"  Bands {bands}  gray=missed 2 sweeps/1m+  [H/?] help  [D] diag",
-        f"  {bands}  gray=2 sweeps/1m+  [H]help",
-        f"  {bands}  gray=2 sweeps/1m+",
+        f"  Bands {bands}  gray=missed 2 band sweeps  [H/?] help  [D] diag",
+        f"  {bands}  gray=2 band sweeps  [H]help",
+        f"  {bands}  gray=2 sweeps",
         f"  Bands {bands}  [H/?] help",
         f"  Bands {bands}",
     ):
