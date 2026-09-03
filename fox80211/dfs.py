@@ -1,4 +1,5 @@
 """Structured, passive DFS events from Linux and bounded correlation state."""
+
 from __future__ import annotations
 
 import queue
@@ -37,6 +38,8 @@ class ChannelSwitch:
     target_channel: int | None
     target_frequency: int | None = None
     from_dfs: bool = False
+    switch_count: int | None = None
+    operating_class: int | None = None
 
     @property
     def label(self) -> str:
@@ -46,18 +49,24 @@ class ChannelSwitch:
 def parse_iw_event(line: str, timestamp: float | None = None) -> DfsEvent | None:
     lower = line.casefold()
     kinds = (
-        ("radar detected", DfsKind.RADAR), ("cac started", DfsKind.CAC_STARTED),
-        ("cac finished", DfsKind.CAC_FINISHED), ("cac aborted", DfsKind.CAC_ABORTED),
-        ("nop finished", DfsKind.NOP_FINISHED), ("pre-cac expired", DfsKind.PRE_CAC_EXPIRED),
+        ("radar detected", DfsKind.RADAR),
+        ("cac started", DfsKind.CAC_STARTED),
+        ("cac finished", DfsKind.CAC_FINISHED),
+        ("cac aborted", DfsKind.CAC_ABORTED),
+        ("nop finished", DfsKind.NOP_FINISHED),
+        ("pre-cac expired", DfsKind.PRE_CAC_EXPIRED),
     )
     kind = next((value for token, value in kinds if token in lower), None)
     if kind is None:
         return None
     freq = re.search(r"(?:freq(?:uency)?)[=: ]+(\d+)", line, re.IGNORECASE)
     chan = re.search(r"(?:chan(?:nel)?)[=: ]+(\d+)", line, re.IGNORECASE)
-    return DfsEvent(kind, time.time() if timestamp is None else timestamp,
-                    int(freq.group(1)) if freq else None,
-                    int(chan.group(1)) if chan else None)
+    return DfsEvent(
+        kind,
+        time.time() if timestamp is None else timestamp,
+        int(freq.group(1)) if freq else None,
+        int(chan.group(1)) if chan else None,
+    )
 
 
 class EventHistory:
@@ -67,28 +76,43 @@ class EventHistory:
     def add(self, event: DfsEvent | ChannelSwitch) -> None:
         self.items.append(event)
 
-    def radar_for(self, frequency: int | None, timestamp: float, window: float = 10.0) -> bool:
+    def radar_for(
+        self, frequency: int | None, timestamp: float, window: float = 10.0
+    ) -> bool:
         # Raw events remain separate; this only answers a UI correlation query.
-        return any(isinstance(e, DfsEvent) and e.kind is DfsKind.RADAR
-                   and e.frequency == frequency and abs(timestamp - e.timestamp) <= window
-                   for e in self.items)
+        return any(
+            isinstance(event, DfsEvent)
+            and event.kind is DfsKind.RADAR
+            and event.frequency == frequency
+            and 0 <= timestamp - event.timestamp <= window
+            for event in self.items
+        )
 
 
 class DfsEventMonitor:
     """Run ``iw event -t`` off the UI thread; unsupported drivers degrade cleanly."""
+
     def __init__(self, phy: str):
         self.phy = phy
         self.events: queue.Queue[DfsEvent] = queue.Queue(maxsize=128)
         self.process: subprocess.Popen[str] | None = None
         self.reader: threading.Thread | None = None
         self.stderr = tempfile.TemporaryFile(mode="w+t")
-        self.available = False
+        self.started = False
+
+    @property
+    def available(self) -> bool:
+        """Whether the event listener is still alive, not merely spawned."""
+        return bool(self.started and self.process and self.process.poll() is None)
 
     def start(self) -> None:
-        self.process = subprocess.Popen(["iw", "event", "-t"], stdout=subprocess.PIPE,
-                                        stderr=self.stderr, text=True)
-        self.available = True
-        self.reader = threading.Thread(target=self._read, name="80211fox-dfs", daemon=True)
+        self.process = subprocess.Popen(
+            ["iw", "event", "-t"], stdout=subprocess.PIPE, stderr=self.stderr, text=True
+        )
+        self.started = True
+        self.reader = threading.Thread(
+            target=self._read, name="80211fox-dfs", daemon=True
+        )
         self.reader.start()
 
     def _read(self) -> None:
@@ -105,18 +129,26 @@ class DfsEventMonitor:
                 continue
             event = parse_iw_event(line)
             if event:
-                try: self.events.put_nowait(event)
+                try:
+                    self.events.put_nowait(event)
                 except queue.Full:
-                    try: self.events.get_nowait()
-                    except queue.Empty: pass
-                    try: self.events.put_nowait(event)
-                    except queue.Full: pass
+                    try:
+                        self.events.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        self.events.put_nowait(event)
+                    except queue.Full:
+                        pass
 
     def stop(self) -> None:
         if self.process and self.process.poll() is None:
             self.process.terminate()
-            try: self.process.wait(timeout=2)
+            try:
+                self.process.wait(timeout=2)
             except subprocess.TimeoutExpired:
-                self.process.kill(); self.process.wait()
-        if self.reader: self.reader.join(timeout=2)
+                self.process.kill()
+                self.process.wait()
+        if self.reader:
+            self.reader.join(timeout=2)
         self.stderr.close()

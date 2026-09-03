@@ -16,6 +16,21 @@ DISCOVERY_FILTER = "wlan.fc.type_subtype == 8 || wlan.fc.type_subtype == 5"
 EVENT_QUEUE_SIZE = 1024
 TARGET_EVENT_INTERVAL = 0.05
 CaptureEvent = tuple[str, str, int, int | None, int | None]
+CSA_FIELDS = (
+    "wlan_mgt.tag.csa.new_channel",
+    "wlan_mgt.extended_channel_switch_announcement.new_channel",
+    "wlan_mgt.tag.ext_csa.new_channel",
+    "wlan.csa.new_channel_number",
+)
+CSA_COUNT_FIELDS = (
+    "wlan_mgt.tag.csa.channel_switch_count",
+    "wlan_mgt.tag.ext_csa.channel_switch_count",
+    "wlan.csa.channel_switch_count",
+)
+ECSA_CLASS_FIELDS = (
+    "wlan_mgt.tag.ext_csa.new_reg_class",
+    "wlan.extended_channel_switch_announcement.new_operating_class",
+)
 
 
 class TsharkCapture:
@@ -30,10 +45,9 @@ class TsharkCapture:
     )
     OPTIONAL_FIELDS = (
         "wlan.ssid_raw",
-        "wlan_mgt.tag.csa.new_channel",
-        "wlan_mgt.extended_channel_switch_announcement.new_channel",
-        "wlan_mgt.tag.ext_csa.new_channel",
-        "wlan.csa.new_channel_number",
+        *CSA_FIELDS,
+        *CSA_COUNT_FIELDS,
+        *ECSA_CLASS_FIELDS,
     )
 
     def __init__(self, interface: str, target_bssid: str | None = None):
@@ -245,27 +259,39 @@ def extract_channel_switch(
     timestamp: float | None = None,
 ) -> ChannelSwitch | None:
     """Extract CSA/ECSA without interpreting it as radar."""
-    names = (
-        "wlan_mgt.tag.csa.new_channel",
-        "wlan_mgt.extended_channel_switch_announcement.new_channel",
-        "wlan_mgt.tag.ext_csa.new_channel",
-        "wlan.csa.new_channel_number",
-    )
     target = next(
         (
             _integer(values.get(name, ""))
-            for name in names
+            for name in CSA_FIELDS
             if _integer(values.get(name, "")) is not None
         ),
         None,
     )
     if target is None:
         return None
+    count = next(
+        (
+            _integer(values.get(name, ""))
+            for name in CSA_COUNT_FIELDS
+            if _integer(values.get(name, "")) is not None
+        ),
+        None,
+    )
+    operating_class = next(
+        (
+            _integer(values.get(name, ""))
+            for name in ECSA_CLASS_FIELDS
+            if _integer(values.get(name, "")) is not None
+        ),
+        None,
+    )
     return ChannelSwitch(
         time.time() if timestamp is None else timestamp,
         bssid.upper(),
         old_channel,
         target,
+        switch_count=count,
+        operating_class=operating_class,
     )
 
 
