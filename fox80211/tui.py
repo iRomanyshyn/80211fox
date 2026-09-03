@@ -91,26 +91,30 @@ def scan_layout(width: int) -> ScanLayout:
     frequency = usable >= 105
     bssid = usable >= 62
     last = usable >= 78
-    fixed = 5 + 5 + 10  # RSSI, channel, event
-    fixed += 18 if bssid else 0
+    # Field widths plus one separator between every visible column.  Keeping
+    # this calculation in sync with scan_header/scan_row lets SSID consume all
+    # remaining space instead of leaving an unexplained gap at the right.
+    visible_optional = sum((signal, frequency, bssid, last))
+    fixed = 4 + 3 + 8 + 3 + visible_optional  # fields and all separators
+    fixed += 18 if signal else 0
+    fixed += 5 if frequency else 0
+    fixed += 17 if bssid else 0
     fixed += 7 if last else 0
-    fixed += 7 if frequency else 0
-    fixed += 20 if signal else 0
     return ScanLayout(usable, signal, frequency, bssid, last, max(8, usable - fixed))
 
 
 def scan_header(layout: ScanLayout) -> str:
-    parts = ["RSSI", "CH", "EVENT"]
+    parts = [f"{'RSSI':>4}", f"{'CH':>3}", f"{'STATUS':<8}"]
     if layout.signal:
-        parts.append("SIGNAL")
+        parts.append(f"{'SIGNAL':<18}")
     if layout.frequency:
-        parts.append("FREQ")
+        parts.append(f"{'FREQ':>5}")
     if layout.bssid:
-        parts.append("BSSID")
-    parts.append("SSID")
+        parts.append(f"{'BSSID':<17}")
+    parts.append(f"{'SSID':<{layout.ssid_width}}")
     if layout.last:
-        parts.append("LAST")
-    return "  ".join(parts)[: layout.width]
+        parts.append(f"{'LAST':<7}")
+    return " ".join(parts)[: layout.width].ljust(layout.width)
 
 
 def scan_row(
@@ -219,6 +223,7 @@ class Application:
         self.capture_statistics: TsharkCapture | None = None
         self.capture_totals = [0, 0, 0, 0]
         self.diagnostics = False
+        self.help_visible = False
         self.diagnostics_selected = 0
         self.channels: dict[int, Channel] = {}
         self.event_history = EventHistory()
@@ -598,6 +603,10 @@ class Application:
             elif key in (curses.KEY_DOWN, "j"):
                 self.diagnostics_selected += 1
             return True
+        if self.help_visible:
+            if key in (27, "\x1b", "h", "H", "?", "q", "Q"):
+                self.help_visible = False
+            return True
         if key in ("q", "Q", "\x03", 3):
             self.running = False
         elif self.hunt:
@@ -626,6 +635,8 @@ class Application:
         elif key in ("d", "D"):
             self.diagnostics = True
             self.diagnostics_selected = 0
+        elif key in ("h", "H", "?"):
+            self.help_visible = True
         elif key in ("2", "5", "6"):
             band = int(key)
             # Serialize band changes with channel tuning. This makes the band
@@ -716,7 +727,9 @@ class Application:
             )
             self.screen.refresh()
             return
-        if self.diagnostics:
+        if self.help_visible:
+            self._draw_help()
+        elif self.diagnostics:
             self._draw_diagnostics()
         elif self.hunt:
             self._draw_hunt(self.hunt)
@@ -756,7 +769,7 @@ class Application:
             width - 1,
         )
         layout = scan_layout(width)
-        self.screen.addnstr(2, 0, scan_header(layout), width - 1)
+        self.screen.addnstr(2, 0, scan_header(layout), width - 1, curses.A_BOLD)
         if self.tune_error:
             self.screen.addnstr(
                 1, 0, self.tune_error, self.screen.getmaxyx()[1] - 1, curses.A_BOLD
@@ -803,6 +816,33 @@ class Application:
             scan_controls(action, self.enabled_bands, width - 1),
             width - 1,
             curses.A_BOLD,
+        )
+
+    def _draw_help(self) -> None:
+        """Draw a compact glossary and key reference for the scan table."""
+        height, width = self.screen.getmaxyx()
+        lines = (
+            ("HELP — SCAN TABLE", curses.A_BOLD),
+            ("RSSI: signal strength in dBm; closer to 0 is stronger.", 0),
+            ("STATUS: DFS = radar-sensitive channel (not a radar alert).", 0),
+            (
+                "RADAR = locally confirmed; MOVE/CSA = AP announced a channel switch.",
+                0,
+            ),
+            (
+                "CAC = channel availability check; NOP = channel temporarily unavailable.",
+                0,
+            ),
+            ("", 0),
+            ("[2] toggle 2.4 GHz networks   [5] toggle 5 GHz networks", 0),
+            ("[6] toggle 6 GHz networks     on/off in the footer shows visibility.", 0),
+            ("[F] filter  [R] clear  [Space] pause/resume  [Enter] hunt", 0),
+            ("[D] diagnostics  [Up/Down] select", 0),
+        )
+        for row, (line, attr) in enumerate(lines[: max(0, height - 1)]):
+            self.screen.addnstr(row, 0, line, width - 1, attr)
+        self.screen.addnstr(
+            height - 1, 0, "[H/?/Esc/Q] return to scan", width - 1, curses.A_BOLD
         )
 
     def _draw_diagnostics(self) -> None:
@@ -1102,9 +1142,12 @@ def scan_controls(action: str, enabled_bands: set[int], width: int) -> str:
         f"{band}:{'on' if band in enabled_bands else 'off'}" for band in BANDS
     )
     for suffix in (
-        f"  {bands}  dim=unseen 1m+  [D] diag",
+        f"  Bands {bands}  dim=unseen 1m+  [H/?] help  [D] diag",
+        f"  {bands}  dim=unseen 1m+  [H]help",
         f"  {bands}  dim=unseen 1m+",
-        f"  {bands}",
+        f"  Bands {bands}  [H/?] help",
+        f"  Bands {bands}",
+        "  [H/?] help",
     ):
         if len(controls) + len(suffix) <= width:
             return controls + suffix
