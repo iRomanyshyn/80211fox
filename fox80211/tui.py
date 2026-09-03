@@ -260,7 +260,7 @@ class Application:
         self.hunt_notice: HuntNotice | None = None
         self.deferred_dfs_events: deque[DfsEvent | ChannelSwitch] = deque(maxlen=256)
         self.csa_available = False
-        self.completed_sweeps = 0
+        self.completed_sweep_starts = {band: deque(maxlen=2) for band in BANDS}
 
     def run(self) -> None:
         channels = available_channels(self.adapter.phy)
@@ -475,13 +475,20 @@ class Application:
             if self.hunt is None:
                 scanned_frequency = False
                 sweep_started = time.monotonic()
-                for frequency, _ in frequencies:
+                with self.tune_lock:
+                    planned = [
+                        item
+                        for item in frequencies
+                        if network_band(item[0]) in self.enabled_bands
+                        or network_band(item[0]) is None
+                    ]
+                visited: set[int] = set()
+                for frequency, _ in planned:
                     if self.stop_event.is_set() or self.hunt is not None or self.paused:
                         break
                     band = network_band(frequency)
                     if band is not None and band not in self.enabled_bands:
                         continue
-                    scanned_frequency = True
                     try:
                         with self.tune_lock:
                             band = network_band(frequency)
@@ -490,6 +497,8 @@ class Application:
                                 and not self.paused
                                 and (band is None or band in self.enabled_bands)
                             ):
+                                scanned_frequency = True
+                                visited.add(frequency)
                                 tune_started = time.monotonic()
                                 monitor.set_frequency(frequency)
                                 self.tune_statistics.record(
@@ -510,7 +519,17 @@ class Application:
                     and not self.paused
                 ):
                     self.tune_statistics.last_sweep = time.monotonic() - sweep_started
-                    self.completed_sweeps += 1
+                    # A band toggle can skip a planned frequency midway through
+                    # a loop. Count a pass only for bands whose complete plan
+                    # was actually visited, so disabled bands never age APs.
+                    for band in BANDS:
+                        band_plan = {
+                            frequency
+                            for frequency, _ in planned
+                            if network_band(frequency) == band
+                        }
+                        if band_plan and band_plan <= visited:
+                            self.completed_sweep_starts[band].append(sweep_started)
                     self.expire_after = scan_expiry(
                         len(frequencies), self.tune_statistics.last_sweep
                     )
@@ -568,9 +587,13 @@ class Application:
             return
         for _ in range(EVENTS_PER_TICK):
             try:
-                bssid, ssid, rssi, channel, frequency = capture.events.get_nowait()
+                event = capture.events.get_nowait()
             except queue.Empty:
                 break
+            bssid, ssid, rssi, channel, frequency = event[:5]
+            # Five-field events are retained for third-party capture producers;
+            # TsharkCapture includes the timestamp from its reader thread.
+            observed_at = event[5] if len(event) > 5 else None
             # Keep draining the bounded capture path while paused, but do not
             # let packets received on the last tuned channel change the frozen
             # scan view.
@@ -580,8 +603,7 @@ class Application:
             if ap:
                 if ssid != MISSING_SSID or ap.ssid == MISSING_SSID:
                     ap.ssid = ssid
-                ap.update(rssi, channel, frequency)
-                ap.last_seen_sweep = self.completed_sweeps + 1
+                ap.update(rssi, channel, frequency, observed_at)
             else:
                 self.aps[bssid] = AccessPoint(
                     bssid,
@@ -592,7 +614,9 @@ class Application:
                     average=float(rssi),
                     minimum=rssi,
                     maximum=rssi,
-                    last_seen_sweep=self.completed_sweeps + 1,
+                    last_seen=(
+                        observed_at if observed_at is not None else time.monotonic()
+                    ),
                 )
         if apply:
             now = time.monotonic()
@@ -820,7 +844,7 @@ class Application:
             index = offset + row
             now = self.paused_at if self.paused_at is not None else time.monotonic()
             age = now - ap.last_seen
-            uncertain = scan_is_uncertain(ap, self.completed_sweeps, age)
+            uncertain = scan_is_uncertain(ap, self.completed_sweep_starts, age)
             rssi = round(smoothed_rssi(ap))
             metadata = self.channels.get(ap.frequency or 0)
             line = scan_row(
@@ -1113,10 +1137,16 @@ def scan_expiry(frequency_count: int, last_sweep: float | None = None) -> float:
     return max(EXPIRE_AFTER, measured, estimated)
 
 
-def scan_is_uncertain(ap: AccessPoint, completed_sweeps: int, age: float) -> bool:
+def scan_is_uncertain(
+    ap: AccessPoint,
+    completed_sweep_starts: dict[int, deque[float]],
+    age: float,
+) -> bool:
     """Return whether an AP should be greyed as no longer reliably present."""
-    missed_sweeps = max(0, completed_sweeps - ap.last_seen_sweep)
-    return missed_sweeps >= 2 or age >= UNCERTAIN_AFTER
+    band = network_band(ap.frequency)
+    sweeps = completed_sweep_starts.get(band, ())
+    missed_two_sweeps = len(sweeps) >= 2 and ap.last_seen < sweeps[0]
+    return missed_two_sweeps or age >= UNCERTAIN_AFTER
 
 
 def capture_counters(capture: TsharkCapture) -> tuple[int, int, int, int]:

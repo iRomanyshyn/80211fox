@@ -15,7 +15,7 @@ from .model import MISSING_SSID
 DISCOVERY_FILTER = "wlan.fc.type_subtype == 8 || wlan.fc.type_subtype == 5"
 EVENT_QUEUE_SIZE = 1024
 TARGET_EVENT_INTERVAL = 0.05
-CaptureEvent = tuple[str, str, int, int | None, int | None]
+CaptureEvent = tuple[str, str, int, int | None, int | None, float]
 CSA_FIELDS = (
     "wlan_mgt.tag.csa.new_channel",
     "wlan_mgt.extended_channel_switch_announcement.new_channel",
@@ -122,6 +122,7 @@ class TsharkCapture:
                         max(signals),
                         _integer(row[3]),
                         _integer(row[4]),
+                        time.monotonic(),
                     )
                 )
                 values = dict(zip(self.fields, row))
