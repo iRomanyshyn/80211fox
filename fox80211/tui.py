@@ -381,10 +381,15 @@ class Application:
                     ),
                     None,
                 )
-                # Do not leave the announcing AP before its countdown reaches
-                # zero. A later observation on the new channel also updates the
-                # target naturally if the zero-count frame is missed.
-                if target and switch.switch_count == 0:
+                # Do not leave the announcing AP before a known countdown
+                # reaches zero. Some TShark builds expose the target field but
+                # not the countdown field, however. Treat that unknown count
+                # as actionable: SCAN will keep showing the AP on its announced
+                # channel and, crucially, HUNT can retune instead of remaining
+                # locked to the old channel with no way to observe the AP again.
+                # A later observation on the new channel still confirms and
+                # refreshes the target naturally.
+                if target and switch.switch_count in (None, 0):
                     # The hopper observes this model update under its tune lock
                     # and follows the selected BSSID to the announced channel.
                     ap.channel, ap.frequency = target.number, target.frequency
