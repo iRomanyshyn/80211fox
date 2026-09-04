@@ -382,8 +382,9 @@ class Application:
                     None,
                 )
                 # Do not leave the announcing AP before its countdown reaches
-                # zero. A later observation on the new channel also updates the
-                # target naturally if the zero-count frame is missed.
+                # zero. An unavailable countdown does not establish that the
+                # switch has happened, so keep the last observed frequency
+                # until a zero-count frame or a later observation confirms it.
                 if target and switch.switch_count == 0:
                     # The hopper observes this model update under its tune lock
                     # and follows the selected BSSID to the announced channel.

@@ -137,6 +137,13 @@ reduce coverage rather than stopping capture.
 - **CSA** is an ordinary observed Channel Switch Announcement where calling it
   DFS-related is not justified.
 
+When an observed CSA/ECSA reaches a zero countdown, the SCAN row moves to the
+announced channel and an active HUNT follows it automatically. When the installed
+TShark exposes the target-channel field but not the countdown, the last observed
+channel is preserved until a zero-count frame or an observation on the target
+confirms the move. The current SSID/BSSID filter remains active, so a matching
+row stays in filtered results while its channel value changes.
+
 The selected adapter's local CAC/NOP/DFS state is **not** automatically the
 state of a remote Cisco, Aruba, or other AP. A CSA alone is never presented as
 confirmed radar. When a captured frame does not provide usable SSID bytes, the

@@ -148,6 +148,48 @@ class DfsTests(unittest.TestCase):
         app._dfs_events(capture)
         self.assertEqual(ap.frequency, 6115)
 
+    def test_csa_without_available_count_preserves_observed_channel(self):
+        app = Application(Mock(), Adapter("wlan1", "phy1"))
+        ap = AccessPoint("AA", "Office", -50, 124, 5620)
+        app.aps[ap.bssid] = ap
+        app.filter = "off"
+        app.channels = {
+            5620: Channel(5620, 124, radar=True),
+            5745: Channel(5745, 149),
+        }
+        capture = Mock(channel_switches=queue.Queue())
+        capture.channel_switches.put(ChannelSwitch(1, "AA", 124, 149))
+
+        app._dfs_events(capture)
+
+        self.assertEqual((ap.channel, ap.frequency), (124, 5620))
+        self.assertEqual(ap.event_label, "MOVE")
+        self.assertEqual(app._visible(), [ap])
+
+    def test_csa_without_available_count_keeps_hunt_on_observed_channel(self):
+        app = Application(Mock(), Adapter("wlan1", "phy1"))
+        ap = AccessPoint("AA", "Office", -50, 124, 5620)
+        app.aps[ap.bssid] = ap
+        app.hunt = ap
+        app.current_frequency = 5620
+        app.channels = {
+            5620: Channel(5620, 124, radar=True),
+            5745: Channel(5745, 149),
+        }
+        capture = Mock(channel_switches=queue.Queue())
+        capture.channel_switches.put(ChannelSwitch(1, "AA", 124, 149))
+        app._dfs_events(capture)
+        monitor = Mock()
+        app.stop_event.wait = Mock(
+            side_effect=lambda _timeout: app.stop_event.set()
+        )
+
+        app._hop(monitor, [(5620, 124), (5745, 149)])
+
+        monitor.set_frequency.assert_not_called()
+        self.assertEqual(app.current_frequency, 5620)
+        self.assertFalse(app.locking_hunt)
+
     def test_duplicate_channel_number_resolves_within_source_band(self):
         app = Application(Mock(), Adapter("wlan1", "phy1"))
         ap = AccessPoint("AA", "Office", -50, 1, 5955)
