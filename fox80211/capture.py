@@ -107,6 +107,14 @@ class TsharkCapture:
             if len(row) != len(self.fields) or not row[0]:
                 self.parse_errors += 1
                 continue
+            # CSA/ECSA information belongs to the 802.11 management frame and
+            # remains useful when the radiotap header has no usable RSSI. Do
+            # not make channel-switch tracking depend on signal metadata that
+            # some adapters and capture formats legitimately omit.
+            values = dict(zip(self.fields, row))
+            switch = extract_channel_switch(values, row[0], _integer(row[3]))
+            if switch:
+                self._emit_channel_switch(switch)
             try:
                 # Multiple antenna values are comma-separated; strongest is useful for hunting.
                 signals = [int(x) for x in row[2].split(",") if x]
@@ -125,24 +133,26 @@ class TsharkCapture:
                         time.monotonic(),
                     )
                 )
-                values = dict(zip(self.fields, row))
-                switch = extract_channel_switch(values, row[0], _integer(row[3]))
-                if switch:
-                    try:
-                        self.channel_switches.put_nowait(switch)
-                    except queue.Full:
-                        try:
-                            self.channel_switches.get_nowait()
-                        except queue.Empty:
-                            pass
-                        try:
-                            self.channel_switches.put_nowait(switch)
-                        except queue.Full:
-                            pass
                 self.frames_with_rssi += 1
             except ValueError:
                 self.parse_errors += 1
                 continue
+
+    def _emit_channel_switch(self, switch: ChannelSwitch) -> None:
+        try:
+            self.channel_switches.put_nowait(switch)
+        except queue.Full:
+            # Like signal events, switches are time-sensitive: retain the most
+            # recent announcement rather than letting stale queue entries hide
+            # a subsequent countdown or destination update.
+            try:
+                self.channel_switches.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.channel_switches.put_nowait(switch)
+            except queue.Full:
+                pass
 
     def _emit(self, event: CaptureEvent) -> None:
         if self.target_bssid and event[0].casefold() == self.target_bssid:
