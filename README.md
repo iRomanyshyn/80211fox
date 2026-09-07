@@ -100,7 +100,11 @@ the field is active. Backspace edits, Enter commits the filter, Escape cancels
 the edit, arrows select, and Enter starts HUNT outside the filter field. Space
 freezes or resumes the scan, including its access-point values and ordering. In
 HUNT, `B` toggles cadence beeps, `R` resets statistics, Escape returns to
-scanning, and `Q` quits. Without a target frame, beeps stop and HUNT displays
+scanning, and `Q` quits. HUNT also identifies the target's band and DFS/event
+status. On terminals with enough rows it lists other discovered access points
+on the same frequency, strongest first, as potential sources of co-channel
+interference; each entry includes its BSSID, SSID, smoothed RSSI, and observation
+age. Without a target frame, beeps stop and HUNT displays
 `SIGNAL LOST` after two seconds on 2.4 GHz or five seconds on 5/6 GHz. SCAN sorts
 all observations by smoothed RSSI. An AP with a known band is grayed and marked
 with `?` only after it was not rediscovered during two complete sweeps of that
