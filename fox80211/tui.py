@@ -1126,16 +1126,18 @@ class Application:
         metadata = self.channels.get(ap.frequency or 0)
         band = network_band(ap.frequency)
         status = ap.event_label
-        if metadata and metadata.dfs_state == "UNAVAILABLE":
-            status = "NOP"
-        elif metadata and metadata.dfs_state == "CAC":
-            status = "CAC"
-        elif status == "-" and metadata and metadata.radar:
-            status = "DFS"
+        if status == "-":
+            if metadata and metadata.dfs_state == "UNAVAILABLE":
+                status = "NOP"
+            elif metadata and metadata.dfs_state == "CAC":
+                status = "CAC"
+            elif metadata and metadata.radar:
+                status = "DFS"
+        band_label = "2.4 GHz" if band == 2 else f"{band} GHz" if band else "?"
         self.screen.addnstr(
             13,
             2,
-            f"band {f'{band} GHz' if band else '?'}   status {status}   "
+            f"band {band_label}   status {status}   "
             "RSSI proximity is approximate",
             max(0, terminal_width - 3),
         )
@@ -1187,7 +1189,7 @@ class Application:
                 f"{round(smoothed_rssi(neighbor)):4} dBm  "
                 f"{neighbor.bssid:<17.17}  {neighbor.ssid}  last {format_age(age)}"
             )
-            self.screen.addnstr(row, 2, line, max(0, width - 3))
+            self.screen.addstr(row, 2, fit_cells(line, max(0, width - 3)))
 
 
 def hunt_neighbors(
