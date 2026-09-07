@@ -50,6 +50,7 @@ SCAN_GRADIENT_COLORS = (
 SCAN_GRADIENT_PAIR_START = 16
 scan_gradient_pairs: tuple[int, ...] = ()
 color_pairs_configured = False
+SIGNAL_COLUMN_WIDTH = len("VERY FAR / HEAVILY OBSTRUCTED")
 
 
 @dataclass
@@ -97,7 +98,7 @@ def scan_layout(width: int) -> ScanLayout:
     # remaining space instead of leaving an unexplained gap at the right.
     visible_optional = sum((signal, frequency, bssid, last))
     fixed = 4 + 3 + 8 + 3 + visible_optional  # fields and all separators
-    fixed += 18 if signal else 0
+    fixed += SIGNAL_COLUMN_WIDTH if signal else 0
     fixed += 5 if frequency else 0
     fixed += 17 if bssid else 0
     fixed += 7 if last else 0
@@ -107,7 +108,7 @@ def scan_layout(width: int) -> ScanLayout:
 def scan_header(layout: ScanLayout) -> str:
     parts = [f"{'RSSI':>4}", f"{'CH':>3}", f"{'STATUS':<8}"]
     if layout.signal:
-        parts.append(f"{'SIGNAL':<18}")
+        parts.append(f"{'SIGNAL':<{SIGNAL_COLUMN_WIDTH}}")
     if layout.frequency:
         parts.append(f"{'FREQ':>5}")
     if layout.bssid:
@@ -167,7 +168,7 @@ def scan_row(
         f"{event:<8.8}",
     ]
     if layout.signal:
-        parts.append(f"{proximity(smoothed_rssi(ap))[0]:<18.18}")
+        parts.append(f"{proximity(smoothed_rssi(ap))[0]:<{SIGNAL_COLUMN_WIDTH}}")
     if layout.frequency:
         parts.append(f"{ap.frequency or '?':>5}")
     if layout.bssid:
