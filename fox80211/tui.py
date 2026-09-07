@@ -183,20 +183,45 @@ def scan_row(
 def select_adapter(screen: curses.window, adapters: list[Adapter]) -> Adapter:
     selected = 0
     while True:
-        screen.erase()
-        screen.addstr(0, 0, "Select Wi-Fi adapter (↑/↓, Enter, Q)", curses.A_BOLD)
-        screen.addstr(
-            2,
-            0,
-            "IFACE        PHY    DRIVER       DEVICE              MODE       ACTIVE MONITOR",
-        )
-        for i, item in enumerate(adapters):
-            attr = curses.A_REVERSE if i == selected else 0
-            active = (
-                "yes" if item.connected else ("no" if item.connection_known else "?")
-            )
-            line = f"{item.interface:12.12} {item.phy:6} {item.driver:12.12} {item.device:19.19} {item.mode:10.10} {active:6} {'yes' if item.monitor else 'no'}"
-            screen.addnstr(3 + i, 0, line, screen.getmaxyx()[1] - 1, attr)
+        try:
+            screen.erase()
+            height, width = screen.getmaxyx()
+            if height < 4 or width < 20:
+                screen.addnstr(
+                    0,
+                    0,
+                    "Terminal too small; resize",
+                    max(1, width - 1),
+                    curses.A_BOLD,
+                )
+            else:
+                screen.addnstr(
+                    0,
+                    0,
+                    "Select Wi-Fi adapter (↑/↓, Enter, Q)",
+                    width - 1,
+                    curses.A_BOLD,
+                )
+                screen.addnstr(
+                    2,
+                    0,
+                    "IFACE        PHY    DRIVER       DEVICE              MODE       ACTIVE MONITOR",
+                    width - 1,
+                )
+                for i, item in enumerate(adapters[: max(0, height - 3)]):
+                    attr = curses.A_REVERSE if i == selected else 0
+                    active = (
+                        "yes"
+                        if item.connected
+                        else ("no" if item.connection_known else "?")
+                    )
+                    line = f"{item.interface:12.12} {item.phy:6} {item.driver:12.12} {item.device:19.19} {item.mode:10.10} {active:6} {'yes' if item.monitor else 'no'}"
+                    screen.addnstr(3 + i, 0, line, width - 1, attr)
+            screen.refresh()
+        except curses.error:
+            # A resize can invalidate coordinates between getmaxyx() and a
+            # write.  The next input/render iteration will use the new size.
+            pass
         key = screen.get_wch()
         if key in ("q", "Q", "\x1b", 27):
             raise KeyboardInterrupt
@@ -206,13 +231,17 @@ def select_adapter(screen: curses.window, adapters: list[Adapter]) -> Adapter:
             selected = min(len(adapters) - 1, selected + 1)
         elif key in ("\n", "\r", 10, 13):
             if adapters[selected].connected:
-                screen.addstr(
-                    1,
-                    0,
-                    "WARNING: this radio and its active connection will be taken offline. Enter to continue.",
-                    curses.A_BOLD,
-                )
-                screen.refresh()
+                try:
+                    screen.addnstr(
+                        1,
+                        0,
+                        "WARNING: this radio and its active connection will be taken offline. Enter to continue.",
+                        max(1, screen.getmaxyx()[1] - 1),
+                        curses.A_BOLD,
+                    )
+                    screen.refresh()
+                except curses.error:
+                    pass
                 if screen.get_wch() not in ("\n", "\r", 10, 13):
                     continue
             return adapters[selected]
@@ -780,23 +809,33 @@ class Application:
         )
 
     def _draw(self) -> None:
-        self.screen.erase()
-        height, width = self.screen.getmaxyx()
-        if height < 4 or width < 20:
-            self.screen.addnstr(
-                0, 0, "Terminal too small; resize", max(1, width - 1), curses.A_BOLD
-            )
+        try:
+            self.screen.erase()
+            height, width = self.screen.getmaxyx()
+            if height < 4 or width < 20:
+                self.screen.addnstr(
+                    0,
+                    0,
+                    "Terminal too small; resize",
+                    max(1, width - 1),
+                    curses.A_BOLD,
+                )
+                self.screen.refresh()
+                return
+            if self.help_visible:
+                self._draw_help()
+            elif self.diagnostics:
+                self._draw_diagnostics()
+            elif self.hunt:
+                self._draw_hunt(self.hunt)
+            else:
+                self._draw_scan()
             self.screen.refresh()
+        except curses.error:
+            # Terminal resizing is asynchronous.  ncurses may reject a write
+            # whose coordinates were valid when this frame started; simply
+            # discard that partial frame and redraw on the next tick.
             return
-        if self.help_visible:
-            self._draw_help()
-        elif self.diagnostics:
-            self._draw_diagnostics()
-        elif self.hunt:
-            self._draw_hunt(self.hunt)
-        else:
-            self._draw_scan()
-        self.screen.refresh()
 
     def _draw_scan(self) -> None:
         state = "PAUSED" if self.paused else "SCANNING"

@@ -160,6 +160,15 @@ class ReviewFixTests(unittest.TestCase):
         self.assertEqual(len(highlighted), 1)
         self.assertIn("00:00:00:00:00:08", highlighted[0])
 
+    def test_resize_during_draw_does_not_terminate_application(self):
+        screen = FakeScreen()
+        screen.addnstr = Mock(side_effect=curses.error("addnwstr() returned ERR"))
+        app = self.make_app(screen)
+
+        app._draw()
+
+        screen.addnstr.assert_called_once()
+
     def test_scan_displays_and_sorts_by_smoothed_average(self):
         screen = FakeScreen()
         app = self.make_app(screen)
