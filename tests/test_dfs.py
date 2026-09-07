@@ -109,6 +109,15 @@ class DfsTests(unittest.TestCase):
         self.assertFalse(scan_layout(80).frequency)
         self.assertTrue(scan_layout(120).signal)
 
+    def test_scan_row_does_not_truncate_long_signal_label(self):
+        ap = AccessPoint("AA:BB:CC:DD:EE:FF", "Office", -90, 124, 5620)
+        layout = scan_layout(120)
+
+        row = scan_row(ap, 0.2, layout)
+
+        self.assertIn("VERY FAR / HEAVILY OBSTRUCTED", row)
+        self.assertLessEqual(len(row), layout.width)
+
     def test_hunt_notification_expires(self):
         notice = hunt_notification(DfsEvent(DfsKind.RADAR, 1, 5620, 124), 124, now=10)
         self.assertEqual(notice.expires, 22)
