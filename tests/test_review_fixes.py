@@ -718,6 +718,42 @@ class ReviewFixTests(unittest.TestCase):
         self.assertTrue(capture.events.empty())
         capture.stderr.close()
 
+    def test_capture_preserves_channel_switch_without_rssi(self):
+        capture = TsharkCapture("mon0")
+        csa_field = "wlan_mgt.tag.csa.new_channel"
+        capture.fields = capture.FIELDS + (csa_field,)
+        capture.process = Mock(
+            stdout=io.StringIO(
+                '"AA:BB:CC:DD:EE:FF"\t"Office"\t""\t"124"\t"5620"\t"36"\n'
+            )
+        )
+
+        capture._read()
+
+        switch = capture.channel_switches.get_nowait()
+        self.assertEqual(switch.bssid, "AA:BB:CC:DD:EE:FF")
+        self.assertEqual(switch.old_channel, 124)
+        self.assertEqual(switch.target_channel, 36)
+        self.assertTrue(capture.events.empty())
+        self.assertEqual(capture.frames_without_rssi, 1)
+        capture.stderr.close()
+
+    def test_capture_preserves_channel_switch_with_malformed_rssi(self):
+        capture = TsharkCapture("mon0")
+        csa_field = "wlan_mgt.tag.csa.new_channel"
+        capture.fields = capture.FIELDS + (csa_field,)
+        capture.process = Mock(
+            stdout=io.StringIO(
+                '"AA:BB:CC:DD:EE:FF"\t"Office"\t"invalid"\t"124"\t"5620"\t"36"\n'
+            )
+        )
+
+        capture._read()
+
+        self.assertEqual(capture.channel_switches.get_nowait().target_channel, 36)
+        self.assertEqual(capture.parse_errors, 1)
+        capture.stderr.close()
+
     def test_malformed_rssi_is_only_a_parse_error(self):
         capture = TsharkCapture("mon0")
         capture.fields = capture.FIELDS
