@@ -16,7 +16,7 @@ from fox80211.capture import (
     _tshark_fields,
 )
 from fox80211.cli import _install_signal_handlers
-from fox80211.model import AccessPoint, Adapter
+from fox80211.model import AccessPoint, Adapter, Channel
 from fox80211.system import (
     MonitorInterface,
     _interface_associated,
@@ -34,6 +34,7 @@ from fox80211.tui import (
     Application,
     TuneStatistics,
     display_width,
+    hunt_neighbors,
     network_band,
     scan_controls,
     scan_expiry,
@@ -673,6 +674,76 @@ class ReviewFixTests(unittest.TestCase):
         app._draw_hunt(AccessPoint("AA", "Office", -50, 1, 2412))
         bar_segments = [text for row, text, _ in screen.writes if row == 7]
         self.assertEqual(sum(map(len, bar_segments)), 156)
+
+    def test_hunt_neighbors_match_frequency_and_sort_by_signal(self):
+        target = AccessPoint("AA", "target", -50, 1, 2412)
+        weak = AccessPoint("BB", "weak", -70, 1, 2412)
+        strong = AccessPoint("CC", "strong", -40, 1, 2412)
+        other_band_same_channel = AccessPoint("DD", "6 GHz", -20, 1, 5955)
+
+        self.assertEqual(
+            [
+                ap.bssid
+                for ap in hunt_neighbors(
+                    target, [weak, target, strong, other_band_same_channel]
+                )
+            ],
+            ["CC", "BB"],
+        )
+
+    @patch("fox80211.tui.curses.color_pair", return_value=0)
+    def test_tall_hunt_view_shows_details_and_cochannel_neighbors(self, _color_pair):
+        screen = FakeScreen(height=22, width=100)
+        app = self.make_app(screen)
+        target = AccessPoint("AA", "Office", -50, 36, 5180)
+        neighbor = AccessPoint("BB", "Guest", -62, 36, 5180)
+        app.aps = {target.bssid: target, neighbor.bssid: neighbor}
+        app.hunt = target
+
+        app._draw_hunt(target)
+
+        rendered = " ".join(text for _, text, _ in screen.writes)
+        self.assertIn("band 5 GHz", rendered)
+        self.assertIn("POTENTIAL INTERFERENCE — SAME CHANNEL (1 seen)", rendered)
+        self.assertIn("Guest", rendered)
+        self.assertTrue(
+            any(
+                row == 21 and "[Esc] scan" in text
+                for row, text, _ in screen.writes
+            )
+        )
+
+    @patch("fox80211.tui.curses.color_pair", return_value=0)
+    def test_hunt_preserves_radar_status_and_labels_24_ghz(self, _color_pair):
+        screen = FakeScreen(height=15, width=100)
+        app = self.make_app(screen)
+        target = AccessPoint("AA", "Office", -50, 1, 2412, event_label="RADAR")
+        app.channels[2412] = Channel(
+            2412, 1, radar=True, dfs_state="UNAVAILABLE"
+        )
+
+        app._draw_hunt(target)
+
+        rendered = " ".join(text for _, text, _ in screen.writes)
+        self.assertIn("band 2.4 GHz", rendered)
+        self.assertIn("status RADAR", rendered)
+        self.assertNotIn("status NOP", rendered)
+
+    @patch("fox80211.tui.curses.color_pair", return_value=0)
+    def test_hunt_neighbor_rows_fit_terminal_cells(self, _color_pair):
+        screen = FakeScreen(height=18, width=40)
+        app = self.make_app(screen)
+        target = AccessPoint("AA", "target", -50, 36, 5180)
+        neighbor = AccessPoint(
+            "00:11:22:33:44:55", "網絡" * 20, -62, 36, 5180
+        )
+        app.aps = {target.bssid: target, neighbor.bssid: neighbor}
+
+        app._draw_hunt(target)
+
+        rows = [text for row, text, _ in screen.writes if row == 16]
+        self.assertEqual(len(rows), 1)
+        self.assertLessEqual(display_width(rows[0]), 37)
 
     def test_expiry_covers_complete_channel_sweep(self):
         self.assertGreaterEqual(scan_expiry(100), (HOP_DWELL + HOP_TUNE_BUDGET) * 100)

@@ -7,7 +7,7 @@ import threading
 import time
 import unicodedata
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 
 from .capture import CSA_FIELDS, TsharkCapture
@@ -1123,10 +1123,22 @@ class Application:
             f"current {ap.rssi:4}   avg {smooth:5.1f}   min {minimum:4}   max {maximum:4}",
         )
         self.screen.addstr(12, 2, f"last {age:5.2f}s   samples {ap.samples}")
+        metadata = self.channels.get(ap.frequency or 0)
+        band = network_band(ap.frequency)
+        status = ap.event_label
+        if status == "-":
+            if metadata and metadata.dfs_state == "UNAVAILABLE":
+                status = "NOP"
+            elif metadata and metadata.dfs_state == "CAC":
+                status = "CAC"
+            elif metadata and metadata.radar:
+                status = "DFS"
+        band_label = "2.4 GHz" if band == 2 else f"{band} GHz" if band else "?"
         self.screen.addnstr(
             13,
             2,
-            "RSSI proximity is approximate; walls and antenna orientation affect it.",
+            f"band {band_label}   status {status}   "
+            "RSSI proximity is approximate",
             max(0, terminal_width - 3),
         )
         if (
@@ -1144,6 +1156,7 @@ class Application:
                     self.screen.addnstr(
                         start + offset, 2, text, max(0, terminal_width - 3)
                     )
+        self._draw_hunt_neighbors(ap)
         self._draw_hunt_controls(terminal_width)
         if self.beep and time.monotonic() - self.last_beep >= beep_interval(smooth):
             self.sound.beep()
@@ -1151,7 +1164,54 @@ class Application:
 
     def _draw_hunt_controls(self, terminal_width: int) -> None:
         controls = f"[B] beep {'ON' if self.beep else 'off'} ({self.sound.name})   [R] reset   [Esc] scan   [Q] quit"
-        self.screen.addnstr(14, 2, controls, max(0, terminal_width - 3))
+        row = min(14, self.screen.getmaxyx()[0] - 1)
+        if self.screen.getmaxyx()[0] > 15:
+            row = self.screen.getmaxyx()[0] - 1
+        self.screen.addnstr(row, 2, controls, max(0, terminal_width - 3))
+
+    def _draw_hunt_neighbors(self, target: AccessPoint) -> None:
+        """List previously observed APs sharing the target's tuned frequency."""
+        height, width = self.screen.getmaxyx()
+        if height < 18:
+            return
+        neighbors = hunt_neighbors(target, self.aps.values())
+        self.screen.addnstr(
+            15,
+            2,
+            f"POTENTIAL INTERFERENCE — SAME CHANNEL ({len(neighbors)} seen)",
+            max(0, width - 3),
+            curses.A_BOLD,
+        )
+        now = time.monotonic()
+        for row, neighbor in enumerate(neighbors[: max(0, height - 17)], 16):
+            age = now - neighbor.last_seen
+            line = (
+                f"{round(smoothed_rssi(neighbor)):4} dBm  "
+                f"{neighbor.bssid:<17.17}  {neighbor.ssid}  last {format_age(age)}"
+            )
+            self.screen.addstr(row, 2, fit_cells(line, max(0, width - 3)))
+
+
+def hunt_neighbors(
+    target: AccessPoint, access_points: Iterable[AccessPoint]
+) -> list[AccessPoint]:
+    """Return strongest known co-channel APs, excluding the hunt target."""
+    return sorted(
+        (
+            ap
+            for ap in access_points
+            if ap.bssid != target.bssid
+            and (
+                (target.frequency is not None and ap.frequency == target.frequency)
+                or (
+                    target.frequency is None
+                    and target.channel is not None
+                    and ap.channel == target.channel
+                )
+            )
+        ),
+        key=lambda ap: (-smoothed_rssi(ap), ap.bssid),
+    )
 
 
 def command_error(error: Exception) -> str:
