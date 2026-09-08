@@ -34,6 +34,8 @@ from fox80211.tui import (
     Application,
     TuneStatistics,
     display_width,
+    bssid_common_octets,
+    bssid_prefix_width,
     hunt_neighbors,
     network_band,
     scan_controls,
@@ -77,6 +79,9 @@ class FakeScreen:
 
     def addnstr(self, row, column, text, length, attributes=0):
         self.addstr(row, column, text[:length], attributes)
+
+    def chgat(self, row, column, length, attributes):
+        self.writes.append((row, f"<highlight {column}:{length}>", attributes))
 
 
 class ReviewFixTests(unittest.TestCase):
@@ -690,6 +695,70 @@ class ReviewFixTests(unittest.TestCase):
             ],
             ["CC", "BB"],
         )
+
+    def test_bssid_similarity_requires_complete_mac_addresses(self):
+        self.assertEqual(
+            bssid_common_octets(
+                "00:11:22:33:44:55", "00:11:22:33:44:AA"
+            ),
+            5,
+        )
+        self.assertEqual(
+            bssid_common_octets(
+                "00:11:22:33:44:55", "00:11:22:99:44:55"
+            ),
+            3,
+        )
+        self.assertEqual(bssid_common_octets("AA", "AA"), 0)
+        self.assertEqual(bssid_prefix_width("00:11:22:33:44:AA", 5), 14)
+
+    @patch("fox80211.tui.curses.color_pair", return_value=0)
+    def test_hunt_marks_and_highlights_a_likely_same_ap(self, _color_pair):
+        screen = FakeScreen(height=22, width=100)
+        app = self.make_app(screen)
+        target = AccessPoint("00:11:22:33:44:55", "Office", -50, 36, 5180)
+        neighbor = AccessPoint("00:11:22:33:44:AA", "Guest", -62, 36, 5180)
+        app.aps = {target.bssid: target, neighbor.bssid: neighbor}
+
+        app._draw_hunt(target)
+
+        rendered = " ".join(text for _, text, _ in screen.writes)
+        self.assertIn("1 likely same AP", rendered)
+        self.assertIn("LIKELY SAME AP", rendered)
+        highlight = next(
+            (text, attributes)
+            for row, text, attributes in screen.writes
+            if row == 16 and text.startswith("<highlight")
+        )
+        self.assertEqual(highlight[0], "<highlight 7:14>")
+        self.assertTrue(highlight[1] & curses.A_UNDERLINE)
+
+    @patch("fox80211.tui.curses.color_pair", return_value=0)
+    def test_hunt_neighbors_have_an_aligned_table_header(self, _color_pair):
+        screen = FakeScreen(height=22, width=100)
+        app = self.make_app(screen)
+        target = AccessPoint("00:11:22:33:44:55", "Office", -50, 36, 5180)
+        neighbor = AccessPoint("00:11:22:99:44:AA", "Guest", -62, 36, 5180)
+        app.aps = {target.bssid: target, neighbor.bssid: neighbor}
+
+        app._draw_hunt(target)
+
+        header = next(text for row, text, _ in screen.writes if row == 15)
+        data = next(
+            text
+            for row, text, _ in screen.writes
+            if row == 16 and not text.startswith("<highlight")
+        )
+        fields = (
+            ("RSSI", 4, "-62"),
+            ("BSSID", 17, neighbor.bssid),
+            ("SSID", 29, "Guest"),
+            ("SAME AP?", 14, "-"),
+            ("LAST", 7, "0.0s"),
+        )
+        for label, field_width, value in fields:
+            start = header.rindex(label) if label == "SSID" else header.index(label)
+            self.assertEqual(data[start : start + field_width].strip(), value)
 
     @patch("fox80211.tui.curses.color_pair", return_value=0)
     def test_tall_hunt_view_shows_details_and_cochannel_neighbors(self, _color_pair):
