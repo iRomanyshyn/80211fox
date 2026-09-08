@@ -103,8 +103,12 @@ HUNT, `B` toggles cadence beeps, `R` resets statistics, Escape returns to
 scanning, and `Q` quits. HUNT also identifies the target's band and DFS/event
 status. On terminals with enough rows it lists other discovered access points
 on the same frequency, strongest first, as potential sources of co-channel
-interference; each entry includes its BSSID, SSID, smoothed RSSI, and observation
-age. Without a target frame, beeps stop and HUNT displays
+interference in an aligned table; each entry includes its BSSID, SSID, smoothed
+RSSI, and observation age when space permits. The shared leading BSSID octets
+are underlined, and a five-octet match (all but the final MAC-address pair) is
+labeled `LIKELY SAME AP`. This is a visual heuristic rather than proof because
+BSSID allocation schemes vary between vendors. Without a target frame, beeps
+stop and HUNT displays
 `SIGNAL LOST` after two seconds on 2.4 GHz or five seconds on 5/6 GHz. SCAN sorts
 all observations by smoothed RSSI. An AP with a known band is grayed and marked
 with `?` only after it was not rediscovered during two complete sweeps of that

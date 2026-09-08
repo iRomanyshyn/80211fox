@@ -86,6 +86,14 @@ class HuntNotice:
     body: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class HuntNeighborLayout:
+    width: int
+    relation_width: int
+    show_last: bool
+    ssid_width: int
+
+
 def scan_layout(width: int) -> ScanLayout:
     """Central responsive policy; DFS/event is never sacrificed for extras."""
     usable = max(1, width - 1)
@@ -1175,21 +1183,102 @@ class Application:
         if height < 18:
             return
         neighbors = hunt_neighbors(target, self.aps.values())
+        likely_count = sum(
+            bssid_common_octets(target.bssid, neighbor.bssid) >= 5
+            for neighbor in neighbors
+        )
         self.screen.addnstr(
-            15,
+            14,
             2,
-            f"POTENTIAL INTERFERENCE — SAME CHANNEL ({len(neighbors)} seen)",
+            f"POTENTIAL INTERFERENCE — SAME CHANNEL ({len(neighbors)} seen) — "
+            f"{likely_count} likely same AP",
             max(0, width - 3),
             curses.A_BOLD,
         )
+        layout = hunt_neighbor_layout(max(0, width - 3))
+        self.screen.addstr(15, 2, hunt_neighbor_header(layout), curses.A_BOLD)
         now = time.monotonic()
         for row, neighbor in enumerate(neighbors[: max(0, height - 17)], 16):
             age = now - neighbor.last_seen
-            line = (
-                f"{round(smoothed_rssi(neighbor)):4} dBm  "
-                f"{neighbor.bssid:<17.17}  {neighbor.ssid}  last {format_age(age)}"
+            common_octets = bssid_common_octets(target.bssid, neighbor.bssid)
+            relation = "LIKELY SAME AP" if common_octets >= 5 else "-"
+            line, bssid_column = hunt_neighbor_row(
+                neighbor, age, relation, layout
             )
-            self.screen.addstr(row, 2, fit_cells(line, max(0, width - 3)))
+            self.screen.addstr(row, 2, line)
+            prefix_width = bssid_prefix_width(neighbor.bssid, common_octets)
+            if prefix_width:
+                self.screen.chgat(
+                    row,
+                    2 + bssid_column,
+                    prefix_width,
+                    curses.A_BOLD | curses.A_UNDERLINE,
+                )
+
+
+def hunt_neighbor_layout(width: int) -> HuntNeighborLayout:
+    """Keep co-channel results tabular, including on narrow terminals."""
+    relation_width = 14 if width >= 54 else 6
+    show_last = width >= 70
+    # RSSI, BSSID and relation are always present, with SSID taking the rest.
+    fixed = 4 + 17 + relation_width + 3
+    if show_last:
+        fixed += 7 + 1
+    return HuntNeighborLayout(
+        width, relation_width, show_last, max(0, width - fixed)
+    )
+
+
+def hunt_neighbor_header(layout: HuntNeighborLayout) -> str:
+    parts = [f"{'RSSI':>4}", f"{'BSSID':<17}"]
+    if layout.ssid_width:
+        parts.append(fit_cells("SSID", layout.ssid_width))
+    parts.append(f"{'SAME AP?':<{layout.relation_width}.{layout.relation_width}}")
+    if layout.show_last:
+        parts.append(f"{'LAST':<7}")
+    return " ".join(parts)[: layout.width].ljust(layout.width)
+
+
+def hunt_neighbor_row(
+    ap: AccessPoint, age: float, relation: str, layout: HuntNeighborLayout
+) -> tuple[str, int]:
+    parts = [f"{round(smoothed_rssi(ap)):4}", f"{ap.bssid:<17.17}"]
+    if layout.ssid_width:
+        parts.append(fit_cells(ap.ssid, layout.ssid_width))
+    parts.append(f"{relation:<{layout.relation_width}.{layout.relation_width}}")
+    if layout.show_last:
+        parts.append(f"{format_age(age):<7.7}")
+    return fit_cells(" ".join(parts), layout.width), 5
+
+
+def bssid_common_octets(first: str, second: str) -> int:
+    """Return the number of complete leading MAC octets shared by two BSSIDs."""
+    compact_first = "".join(c for c in first.casefold() if c in "0123456789abcdef")
+    compact_second = "".join(c for c in second.casefold() if c in "0123456789abcdef")
+    if len(compact_first) != 12 or len(compact_second) != 12:
+        return 0
+    return next(
+        (
+            index
+            for index in range(6)
+            if compact_first[index * 2 : index * 2 + 2]
+            != compact_second[index * 2 : index * 2 + 2]
+        ),
+        6,
+    )
+
+
+def bssid_prefix_width(bssid: str, octets: int) -> int:
+    """Map a matching octet count to characters in the displayed BSSID."""
+    if octets <= 0:
+        return 0
+    hexadecimal = 0
+    for index, character in enumerate(bssid[:17]):
+        if character.casefold() in "0123456789abcdef":
+            hexadecimal += 1
+            if hexadecimal == octets * 2:
+                return index + 1
+    return 0
 
 
 def hunt_neighbors(
